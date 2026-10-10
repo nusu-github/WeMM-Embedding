@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <tuple>
 
 #include "wemm/common.h"
@@ -30,8 +31,11 @@ constexpr int kMaxAlgos = 8;
 cublasLtHandle_t lt_handle() {
   static std::mutex mu;
   static std::map<int, cublasLtHandle_t> handles;
+  thread_local int cached_dev = -1;
+  thread_local cublasLtHandle_t cached = nullptr;
   int dev = 0;
   C10_CUDA_CHECK(cudaGetDevice(&dev));
+  if (dev == cached_dev) return cached;
   std::lock_guard<std::mutex> lock(mu);
   auto it = handles.find(dev);
   if (it == handles.end()) {
@@ -39,7 +43,9 @@ cublasLtHandle_t lt_handle() {
     LT_CHECK(cublasLtCreate(&h));
     it = handles.emplace(dev, h).first;
   }
-  return it->second;
+  cached_dev = dev;
+  cached = it->second;
+  return cached;
 }
 
 bool autotune_enabled() {
@@ -77,6 +83,12 @@ struct Pref {
     LT_CHECK(cublasLtMatmulPreferenceCreate(&p));
     size_t ws = kWorkspace;
     LT_CHECK(cublasLtMatmulPreferenceSetAttribute(p, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+    // The heuristic otherwise assumes 256-byte aligned pointers; row-block
+    // views are only guaranteed 16-byte aligned (checked in gemm_impl).
+    uint32_t align = 16;
+    for (auto a : {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+                   CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES})
+      LT_CHECK(cublasLtMatmulPreferenceSetAttribute(p, a, &align, sizeof(align)));
   }
   ~Pref() { cublasLtMatmulPreferenceDestroy(p); }
 };
@@ -130,34 +142,37 @@ cublasStatus_t run(const Problem& p, const cublasLtMatmulAlgo_t* algo, void* ws,
                         kWorkspace, stream);
 }
 
-// Picks (and caches) an algorithm: the heuristic's first choice, or the
-// fastest of its top candidates when autotuning. Timing runs write the real
-// output (it is recomputed by the final launch; C never aliases D).
-cublasLtMatmulAlgo_t select_algo(const AlgoKey& key, const Problem& p, void* ws, cudaStream_t stream) {
+// Cached algorithm for `key`, if it is valid for this problem.
+std::optional<cublasLtMatmulAlgo_t> lookup_algo(const AlgoKey& key, const Problem& p) {
   std::lock_guard<std::mutex> lock(g_mu);
   auto it = g_algos.find(key);
-  if (it != g_algos.end()) {
-    cublasLtMatmulHeuristicResult_t chk{};
-    if (cublasLtMatmulAlgoCheck(lt_handle(), p.op, p.a, p.b, p.c, p.c, &it->second, &chk) == CUBLAS_STATUS_SUCCESS &&
-        chk.workspaceSize <= kWorkspace)
-      return it->second;
-  }
+  if (it == g_algos.end()) return std::nullopt;
+  cublasLtMatmulHeuristicResult_t chk{};
+  if (cublasLtMatmulAlgoCheck(lt_handle(), p.op, p.a, p.b, p.c, p.c, &it->second, &chk) != CUBLAS_STATUS_SUCCESS ||
+      chk.workspaceSize > kWorkspace)
+    return std::nullopt;
+  return it->second;
+}
+
+// Picks an algorithm (the heuristic's first choice, or the fastest of its top
+// candidates when autotuning) and caches it. Timing runs write p.D, so the
+// caller points D at scratch memory when C aliases the real output.
+cublasLtMatmulAlgo_t tune_algo(const AlgoKey& key, const Problem& p, void* ws, cudaStream_t stream, bool autotune) {
   Pref pref;
   cublasLtMatmulHeuristicResult_t res[kMaxAlgos]{};
   int n = 0;
-  LT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_handle(), p.op, p.a, p.b, p.c, p.c, pref.p,
-                                          autotune_enabled() ? kMaxAlgos : 1, res, &n));
+  LT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_handle(), p.op, p.a, p.b, p.c, p.c, pref.p, autotune ? kMaxAlgos : 1,
+                                          res, &n));
   WEMM_CHECK(n > 0, "gemm: no cuBLASLt algorithm for this problem");
   cublasLtMatmulAlgo_t best = res[0].algo;
   if (n > 1) {
-    const Problem& tp = p;
     Events ev;
     float best_ms = 1e30f;
     for (int i = 0; i < n; ++i) {
       if (res[i].state != CUBLAS_STATUS_SUCCESS || res[i].workspaceSize > kWorkspace) continue;
-      if (run(tp, &res[i].algo, ws, stream) != CUBLAS_STATUS_SUCCESS) continue;  // warm-up
+      if (run(p, &res[i].algo, ws, stream) != CUBLAS_STATUS_SUCCESS) continue;  // warm-up
       C10_CUDA_CHECK(cudaEventRecord(ev.a, stream));
-      for (int r = 0; r < 3; ++r) run(tp, &res[i].algo, ws, stream);
+      for (int r = 0; r < 3; ++r) run(p, &res[i].algo, ws, stream);
       C10_CUDA_CHECK(cudaEventRecord(ev.b, stream));
       C10_CUDA_CHECK(cudaEventSynchronize(ev.b));
       float ms = 0;
@@ -168,8 +183,24 @@ cublasLtMatmulAlgo_t select_algo(const AlgoKey& key, const Problem& p, void* ws,
       }
     }
   }
+  std::lock_guard<std::mutex> lock(g_mu);
   g_algos[key] = best;
   return best;
+}
+
+// Cached or freshly tuned algorithm. When C aliases D (in-place
+// accumulation) tuning writes to a scratch output, never to the accumulator.
+cublasLtMatmulAlgo_t algo_for(const AlgoKey& key, const Problem& p, const at::Tensor& out, void* ws,
+                              cudaStream_t stream, bool autotune) {
+  if (auto a = lookup_algo(key, p)) return *a;
+  Problem tp = p;
+  at::Tensor scratch;
+  if (p.C == p.D) {
+    scratch = at::empty_like(out);
+    tp.C = tp.D = scratch.data_ptr();
+    if (p.beta != 0.f) scratch.zero_();
+  }
+  return tune_algo(key, tp, ws, stream, autotune);
 }
 
 }  // namespace
@@ -196,6 +227,8 @@ void gemm_impl(const at::Tensor& x, const at::Tensor& w, const std::optional<at:
   if (bias)
     WEMM_CHECK(bias->is_contiguous() && bias->numel() == N && bias->scalar_type() == odt,
                "gemm: bias must be contiguous and match the output dtype");
+  for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&d, c, bias ? &*bias : nullptr})
+    WEMM_CHECK(!t || reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0, "gemm: output/residual/bias misaligned");
   if (M == 0) return;
   c10::cuda::CUDAGuard guard(x.device());
 
@@ -222,21 +255,7 @@ void gemm_impl(const at::Tensor& x, const at::Tensor& w, const std::optional<at:
   at::Tensor ws = at::empty({int64_t(kWorkspace)}, x.options().dtype(at::kByte));
   const AlgoKey key{x.get_device(), m_bucket(M), N, K, w.stride(0), x.stride(0), int(epi), int(c != nullptr),
                     int(in_t), int(out_t), 0};
-  cublasLtMatmulAlgo_t algo;
-  if (c && c->data_ptr() == d.data_ptr()) {
-    // In place: timing runs must not touch the accumulator.
-    bool cached;
-    {
-      std::lock_guard<std::mutex> lock(g_mu);
-      cached = g_algos.count(key) != 0;
-    }
-    at::Tensor scratch = cached ? d : at::empty_like(d);
-    Problem tp = p;
-    tp.D = scratch.data_ptr();
-    algo = select_algo(key, tp, ws.data_ptr(), stream);
-  } else {
-    algo = select_algo(key, p, ws.data_ptr(), stream);
-  }
+  const cublasLtMatmulAlgo_t algo = algo_for(key, p, d, ws.data_ptr(), stream, autotune_enabled());
   LT_CHECK(run(p, &algo, ws.data_ptr(), stream));
 }
 
@@ -276,26 +295,9 @@ void gemm_f32_batched(const at::Tensor& a, const at::Tensor& b, at::Tensor& out,
   Problem p{op.d, la.l, lb.l, lc.l, b.data_ptr(), a.data_ptr(), out.data_ptr(), out.data_ptr(), accumulate ? 1.f : 0.f};
   auto stream = at::cuda::getCurrentCUDAStream();
   at::Tensor ws = at::empty({int64_t(kWorkspace)}, a.options().dtype(at::kByte));
-  // Not autotuned (the heuristic pick is fine for these small batched tiles);
-  // cache it so the heuristic runs once per shape bucket.
   const AlgoKey key{a.get_device(), m_bucket(B), M, N, K, 0, -1, int(accumulate), int(CUDA_R_32F), int(CUDA_R_32F), 1};
-  cublasLtMatmulAlgo_t algo;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    auto it = g_algos.find(key);
-    cublasLtMatmulHeuristicResult_t chk{};
-    if (it != g_algos.end() &&
-        cublasLtMatmulAlgoCheck(lt_handle(), p.op, p.a, p.b, p.c, p.c, &it->second, &chk) == CUBLAS_STATUS_SUCCESS) {
-      algo = it->second;
-    } else {
-      Pref pref;
-      cublasLtMatmulHeuristicResult_t res{};
-      int n = 0;
-      LT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_handle(), p.op, p.a, p.b, p.c, p.c, pref.p, 1, &res, &n));
-      WEMM_CHECK(n > 0, "gemm_f32_batched: no cuBLASLt algorithm");
-      algo = g_algos[key] = res.algo;
-    }
-  }
+  // The heuristic's pick is fine for these small batched tiles (no autotune).
+  const cublasLtMatmulAlgo_t algo = algo_for(key, p, out, ws.data_ptr(), stream, /*autotune=*/false);
   LT_CHECK(run(p, &algo, ws.data_ptr(), stream));
 }
 

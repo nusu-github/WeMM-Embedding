@@ -392,9 +392,11 @@ gdn_state_kernel(const float* __restrict__ kd, const float* __restrict__ u, cons
   }
 }
 
-size_t state_smem(bool dbl) {
+constexpr size_t state_smem(bool dbl) {
   return sizeof(float) * ((dbl ? 2 : 1) * kChunk * kDK + 8 * 16 * 32 + 2 * kChunk * kBV);
 }
+static_assert(state_smem(false) <= 65536, "single-buffer state kernel must fit sm_75's 64 KB");
+static_assert(kPrepareSmem <= 65536, "prepare kernel must fit sm_75's 64 KB");
 
 }  // namespace
 
@@ -454,6 +456,8 @@ at::Tensor gdn_chunk_recurrence(const GdnChunks& ch, const at::Tensor& chunk_off
   WEMM_CHECK(num_seqs <= 65535, "too many sequences in one batch (", num_seqs, ")");
   if (carry.defined())
     WEMM_CHECK(carry.is_contiguous() && carry.numel() == H * num_seqs * kDK * DV, "gdn: bad carry buffer");
+  else
+    WEMM_CHECK(chunk_begin == 0, "gdn: a window after the first needs the carry buffer");
   c10::cuda::CUDAGuard guard(ch.qg.device());
   at::Tensor states = at::empty({H, C, kDK, DV}, ch.qg.options());
   at::Tensor vnew = at::empty({H, C, kChunk, DV}, ch.qg.options());

@@ -39,7 +39,8 @@ at::Tensor WeMMModel::vision_fused(const at::Tensor& pixel_values, const VisionP
 // ===================================================================== LM ====
 at::Tensor WeMMModel::text_fused(at::Tensor h, const Packing& pk) {
   const auto& tc = cfg_.text;
-  h = h.to(resid_).contiguous();
+  // Always a private copy: the residual stream is updated in place.
+  h = h.to(resid_, /*non_blocking=*/false, /*copy=*/true).contiguous();
   for (size_t i = 0; i < layers_.size(); ++i) {
     const auto& l = layers_[i];
     const bool last = i + 1 == layers_.size();

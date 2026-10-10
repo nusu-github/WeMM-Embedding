@@ -46,7 +46,12 @@ int64_t floor_by_factor(double number, int64_t factor) { return int64_t(std::flo
 // qwen-vl-utils reads MODEL_SEQ_LEN (default 128000) to bound video tokens;
 // honoured here for parity.
 double model_seq_len() {
-  if (const char* env = std::getenv("MODEL_SEQ_LEN")) return double(int64_t(std::atof(env)));
+  if (const char* env = std::getenv("MODEL_SEQ_LEN")) {
+    char* end = nullptr;
+    const double v = std::strtod(env, &end);
+    WEMM_CHECK(end != env && v > 0, "invalid MODEL_SEQ_LEN '", env, "'");
+    return double(int64_t(v));
+  }
   return 128000;
 }
 
