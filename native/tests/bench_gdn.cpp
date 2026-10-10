@@ -37,10 +37,10 @@ int main(int argc, char** argv) {
   at::Tensor neg_A = -at::rand({H}, dev) * 8 - 0.1;
   at::Tensor dt_bias = at::randn({H}, dev);
 
-  std::vector<int32_t> cs, cv, co{0}, pr;
+  std::vector<int32_t> cs, cv, co{0}, ss;
   int64_t tok = 0;
   for (auto len : lens) {
-    for (int64_t j = 0; j < len; ++j) pr.push_back(int32_t(cs.size() * 64 + j));
+    for (int64_t j = 0; j < len; ++j) ss.push_back(int32_t(tok));
     for (int64_t c = 0; c * 64 < len; ++c) {
       cs.push_back(int32_t(tok + c * 64));
       cv.push_back(int32_t(std::min<int64_t>(64, len - c * 64)));
@@ -52,24 +52,31 @@ int main(int argc, char** argv) {
   at::Tensor chunk_start = i32(cs), chunk_valid = i32(cv), chunk_off = i32(co);
   const int64_t C = int64_t(cs.size());
 
+  at::Tensor seq_start = i32(ss);
   auto ch = wemm::kernels::gdn_chunk_prepare(mixed, b, a, neg_A, dt_bias, chunk_start, chunk_valid, H, H, dk, dv);
-  at::Tensor o = wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, int64_t(lens.size()));
-  at::Tensor o_single = wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, int64_t(lens.size()), 0, at::Tensor(), false);
+  // raw fp32 outputs [L, H*dv]
+  auto output = [&](const wemm::kernels::GdnChunks& c, const wemm::kernels::GdnRecurrence& r, int64_t c0,
+                    at::Tensor& out) {
+    wemm::kernels::gdn_chunk_output(c, r, chunk_start, chunk_valid, seq_start, c0, at::Tensor(), at::Tensor(), 0.0,
+                                    out);
+  };
+  const int64_t N = int64_t(lens.size());
+  at::Tensor o = at::zeros({L, H * dv}, dev), o_single = at::zeros({L, H * dv}, dev);
+  output(ch, wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, N), 0, o);
+  output(ch, wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, N, 0, at::Tensor(), false), 0, o_single);
   std::printf("single-buffer vs double-buffer max diff: %.3e\n", (o - o_single).abs().max().item<double>());
   // windowed (3 chunks per window, state carried across windows)
   {
-    const int64_t C = chunk_start.numel(), W = 3;
-    at::Tensor carry = at::empty({H, int64_t(lens.size()), dk, dv}, mixed.options().dtype(at::kFloat));
-    double md = 0;
-    at::Tensor oc = o.view({H, C, 64, dv});
+    const int64_t W = 3;
+    at::Tensor carry = at::empty({H, N, dk, dv}, mixed.options().dtype(at::kFloat));
+    at::Tensor ow = at::zeros({L, H * dv}, dev);
     for (int64_t c0 = 0; c0 < C; c0 += W) {
       const int64_t c1 = std::min(C, c0 + W);
       auto cw = wemm::kernels::gdn_chunk_prepare(mixed, b, a, neg_A, dt_bias, chunk_start, chunk_valid, H, H, dk, dv,
                                                  c0, c1);
-      at::Tensor ow = wemm::kernels::gdn_chunk_recurrence(cw, chunk_off, int64_t(lens.size()), c0, carry);
-      md = std::max(md, (ow - oc.narrow(1, c0, c1 - c0)).abs().max().item<double>());
+      output(cw, wemm::kernels::gdn_chunk_recurrence(cw, chunk_off, N, c0, carry), c0, ow);
     }
-    std::printf("windowed vs full max diff: %.3e\n", md);
+    std::printf("windowed vs full max diff: %.3e\n", (ow - o).abs().max().item<double>());
   }
 
   // ---- reference: token-by-token recurrence in fp64 (exact semantics).
@@ -94,7 +101,7 @@ int main(int argc, char** argv) {
       }
       off += len;
     }
-    at::Tensor mine = o.view({H, C * 64, dv}).index_select(1, i32(pr).to(at::kLong)).permute({1, 0, 2}).to(at::kDouble);
+    at::Tensor mine = o.view({L, H, dv}).to(at::kDouble);
     double err = (mine - ref).abs().max().item<double>();
     double rel = ((mine - ref).norm() / ref.norm()).item<double>();
     std::printf("L=%lld chunks=%lld  max_abs_err=%.3e  rel_err=%.3e\n", (long long)L, (long long)C, err, rel);
@@ -103,8 +110,14 @@ int main(int argc, char** argv) {
   double tp = time_ms([&] {
     wemm::kernels::gdn_chunk_prepare(mixed, b, a, neg_A, dt_bias, chunk_start, chunk_valid, H, H, dk, dv);
   });
-  double tr = time_ms([&] { wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, int64_t(lens.size())); });
-  double ts = time_ms(
-      [&] { wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, int64_t(lens.size()), 0, at::Tensor(), false); });
-  std::printf("prepare %.3f ms   recurrence %.3f ms (single-buffer %.3f ms)\n", tp, tr, ts);
+  const auto rec = wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, N);
+  double tr = time_ms([&] { wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, N); });
+  double ts = time_ms([&] { wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, N, 0, at::Tensor(), false); });
+  double to = time_ms([&] { output(ch, rec, 0, o); });
+  at::Tensor z = at::randn({L, H * dv}, dev).to(at::kBFloat16), gw = at::rand({dv}, dev), normed = at::empty_like(z);
+  double tn = time_ms([&] {
+    wemm::kernels::gdn_chunk_output(ch, rec, chunk_start, chunk_valid, seq_start, 0, z, gw, 1e-6, normed);
+  });
+  std::printf("prepare %.3f ms   recurrence %.3f ms (single-buffer %.3f ms)   output %.3f ms (+norm %.3f ms)\n", tp,
+              tr, ts, to, tn);
 }

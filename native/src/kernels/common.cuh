@@ -68,6 +68,14 @@ __device__ __forceinline__ void load4(const T* p, float* f) {
 #pragma unroll
   for (int i = 0; i < 4; ++i) f[i] = to_f(h[i]);
 }
+template <typename T>
+__device__ __forceinline__ void store4(T* p, const float* f) {
+  uint2 raw;
+  T* h = reinterpret_cast<T*>(&raw);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) h[i] = from_f<T>(f[i]);
+  *reinterpret_cast<uint2*>(p) = raw;
+}
 
 // ------------------------------------------------------------- reductions
 __device__ __forceinline__ float warp_sum(float v) {

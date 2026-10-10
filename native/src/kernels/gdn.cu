@@ -3,10 +3,10 @@
 //   prepare   (parallel over chunks x heads): q/k/v gather + L2 norm, gates,
 //             in-chunk decay, WY representation -> qg, kd, u, w, aqk, dl
 //   state     (sequential over chunks): S_c and vnew_c per chunk
-//   output    (parallel): o_c = qg_c @ S_c + aqk_c @ vnew_c   (fp32 batched GEMMs)
+//   output    (parallel): o_c = qg_c @ S_c + aqk_c @ vnew_c, fused with the
+//             gated RMSNorm and the scatter back to token rows
 
 #include "common.cuh"
-#include "wemm/gemm.h"
 #include "wemm/kernels.h"
 
 namespace wemm::kernels {
@@ -17,8 +17,9 @@ namespace {
 
 constexpr int kChunk = 64;
 constexpr int kDK = 128;   // key and value head dim
-constexpr int kHalf = 64;  // d-columns per smem tile in the prepare kernel
+constexpr int kPart = 32;  // d-columns per q/k/v smem tile in the prepare kernel
 constexpr int kLt = 68;    // row stride (floats) of the 64x64 smem tiles: float4-aligned, spreads banks
+constexpr int kLp = 36;    // row stride of the 64 x kPart tiles
 constexpr int kBV = 32;    // value columns per block in the state kernel
 constexpr int kThreads = 256;
 
@@ -29,14 +30,14 @@ __device__ __forceinline__ void st4(float* p, float a, float b, float c, float d
 
 // =================================================================== prepare
 // One block per (chunk, value head), 256 threads. The 64x128 q/k/v tiles are
-// processed as two 64x64 column halves so the block needs ~54 KB of shared
-// memory (fits sm_75's 64 KB limit). Phases:
+// processed in 64x32 column parts so the block needs ~45 KB of shared memory
+// (two blocks per SM on sm_86/89, fits sm_75's 64 KB). Phases:
 //   1. gates g, beta and the in-chunk cumulative decay gc; row L2 norms of q, k
 //   2. A = beta_i K_i.K_j decay (i > j) and Aqk = Q_i.K_j decay (i >= j),
 //      accumulated over the two halves; qg = Q e^gc and kd = K e^(g_last-gc)
-//      are written per half
+//      are written per part
 //   3. T = (I + A)^-1, 16x16 blocked (diagonal blocks by forward substitution)
-//   4. u = T (V beta), w = T (K beta e^gc), per half
+//   4. u = T (V beta), w = T (K beta e^gc), per part
 template <typename T>
 __global__ void __launch_bounds__(kThreads)
 gdn_prepare_kernel(const T* __restrict__ mixed, int64_t ld_mixed, const T* __restrict__ bvec,
@@ -51,9 +52,9 @@ gdn_prepare_kernel(const T* __restrict__ mixed, int64_t ld_mixed, const T* __res
   const size_t hc = size_t(h) * C + c;
 
   extern __shared__ __align__(16) float sm[];
-  float* Ks = sm;                   // [64][kLt] K half; later K*beta*e^gc half
-  float* Qs = Ks + kChunk * kLt;    // [64][kLt] Q half; later T
-  float* As = Qs + kChunk * kLt;    // [64][kLt] A (strict lower); later V*beta half
+  float* Ks = sm;                   // [64][kLp] K part; later K*beta*e^gc part
+  float* Qs = Ks + kChunk * kLp;    // [64][kLp] Q part; later T [64][kLt]
+  float* As = Qs + kChunk * kLt;    // [64][kLt] A (strict lower); later V*beta part [64][kLp]
   float* gc = As + kChunk * kLt;    // [64] cumulative log decay
   float* bt = gc + kChunk;          // [64] beta
   float* eg = bt + kChunk;          // [64] e^gc
@@ -114,29 +115,29 @@ gdn_prepare_kernel(const T* __restrict__ mixed, int64_t ld_mixed, const T* __res
   const int ti = tid >> 4, tj = tid & 15;
   const int i0 = ti * 4, j0 = tj * 4;
   float accA[4][4] = {}, accQ[4][4] = {};
-  for (int half = 0; half < 2; ++half) {
+  for (int part = 0; part < kDK / kPart; ++part) {
     __syncthreads();
-    // normalized q, k half tiles: 64 rows x 64 cols, 4 per thread-step
-    for (int idx = tid; idx < kChunk * kHalf / 4; idx += kThreads) {
-      const int r = idx / (kHalf / 4), d = (idx % (kHalf / 4)) * 4;
+    // normalized q, k part tiles: 64 rows x 32 cols, 4 per thread-step
+    for (int idx = tid; idx < kChunk * kPart / 4; idx += kThreads) {
+      const int r = idx / (kPart / 4), d = (idx % (kPart / 4)) * 4;
       float q[4] = {0.f, 0.f, 0.f, 0.f}, k[4] = {0.f, 0.f, 0.f, 0.f};
       if (r < nvalid) {
-        load4(row(r) + kh * kDK + half * kHalf + d, q);
-        load4(row(r) + key_dim + kh * kDK + half * kHalf + d, k);
+        load4(row(r) + kh * kDK + part * kPart + d, q);
+        load4(row(r) + key_dim + kh * kDK + part * kPart + d, k);
       }
-      st4(Qs + r * kLt + d, q[0] * rq[r], q[1] * rq[r], q[2] * rq[r], q[3] * rq[r]);
-      st4(Ks + r * kLt + d, k[0] * rk[r], k[1] * rk[r], k[2] * rk[r], k[3] * rk[r]);
+      st4(Qs + r * kLp + d, q[0] * rq[r], q[1] * rq[r], q[2] * rq[r], q[3] * rq[r]);
+      st4(Ks + r * kLp + d, k[0] * rk[r], k[1] * rk[r], k[2] * rk[r], k[3] * rk[r]);
     }
     __syncthreads();
     if (tj <= ti) {
 #pragma unroll 2
-      for (int d = 0; d < kHalf; d += 4) {
+      for (int d = 0; d < kPart; d += 4) {
         float4 ki[4], qi[4], kj[4];
 #pragma unroll
         for (int x = 0; x < 4; ++x) {
-          ki[x] = ld4(Ks + (i0 + x) * kLt + d);
-          qi[x] = ld4(Qs + (i0 + x) * kLt + d);
-          kj[x] = ld4(Ks + (j0 + x) * kLt + d);
+          ki[x] = ld4(Ks + (i0 + x) * kLp + d);
+          qi[x] = ld4(Qs + (i0 + x) * kLp + d);
+          kj[x] = ld4(Ks + (j0 + x) * kLp + d);
         }
 #pragma unroll
         for (int x = 0; x < 4; ++x)
@@ -147,11 +148,11 @@ gdn_prepare_kernel(const T* __restrict__ mixed, int64_t ld_mixed, const T* __res
           }
       }
     }
-    float* qg = qg_out + hc * kChunk * kDK + half * kHalf;
-    float* kd = kd_out + hc * kChunk * kDK + half * kHalf;
-    for (int idx = tid; idx < kChunk * kHalf / 4; idx += kThreads) {
-      const int r = idx / (kHalf / 4), d = (idx % (kHalf / 4)) * 4;
-      const float4 q = ld4(Qs + r * kLt + d), k = ld4(Ks + r * kLt + d);
+    float* qg = qg_out + hc * kChunk * kDK + part * kPart;
+    float* kd = kd_out + hc * kChunk * kDK + part * kPart;
+    for (int idx = tid; idx < kChunk * kPart / 4; idx += kThreads) {
+      const int r = idx / (kPart / 4), d = (idx % (kPart / 4)) * 4;
+      const float4 q = ld4(Qs + r * kLp + d), k = ld4(Ks + r * kLp + d);
       st4(qg + r * kDK + d, q.x * eg[r], q.y * eg[r], q.z * eg[r], q.w * eg[r]);
       st4(kd + r * kDK + d, k.x * ed[r], k.y * ed[r], k.z * ed[r], k.w * ed[r]);
     }
@@ -217,47 +218,45 @@ gdn_prepare_kernel(const T* __restrict__ mixed, int64_t ld_mixed, const T* __res
     if (m > r) Ts[r * kLt + m] = 0.f;
   }
 
-  // ---- 4. u = T (V*beta), w = T (K*beta*e^gc), 4x4 tile per thread, per half
+  // ---- 4. u = T (V*beta), w = T (K*beta*e^gc), 2x4 tile per thread, per part
   float* Vs = As;
-  for (int half = 0; half < 2; ++half) {
+  for (int part = 0; part < kDK / kPart; ++part) {
     __syncthreads();
-    for (int idx = tid; idx < kChunk * kHalf / 4; idx += kThreads) {
-      const int r = idx / (kHalf / 4), d = (idx % (kHalf / 4)) * 4;
+    for (int idx = tid; idx < kChunk * kPart / 4; idx += kThreads) {
+      const int r = idx / (kPart / 4), d = (idx % (kPart / 4)) * 4;
       float v[4] = {0.f, 0.f, 0.f, 0.f}, k[4] = {0.f, 0.f, 0.f, 0.f};
       if (r < nvalid) {
-        load4(row(r) + 2 * key_dim + h * kDK + half * kHalf + d, v);
-        load4(row(r) + key_dim + kh * kDK + half * kHalf + d, k);
+        load4(row(r) + 2 * key_dim + h * kDK + part * kPart + d, v);
+        load4(row(r) + key_dim + kh * kDK + part * kPart + d, k);
       }
       const float br = bt[r], kr = rk[r], kb = bt[r] * eg[r];
-      st4(Vs + r * kLt + d, v[0] * br, v[1] * br, v[2] * br, v[3] * br);
-      st4(Ks + r * kLt + d, (k[0] * kr) * kb, (k[1] * kr) * kb, (k[2] * kr) * kb, (k[3] * kr) * kb);
+      st4(Vs + r * kLp + d, v[0] * br, v[1] * br, v[2] * br, v[3] * br);
+      st4(Ks + r * kLp + d, (k[0] * kr) * kb, (k[1] * kr) * kb, (k[2] * kr) * kb, (k[3] * kr) * kb);
     }
     __syncthreads();
-    const int tr = tid >> 4, tc = tid & 15;
-    const int r0 = tr * 4, d0 = tc * 4;
-    float su[4][4] = {}, sw[4][4] = {};
-    for (int m = 0; m < r0 + 4; ++m) {
-      float t[4];
+    const int tr = tid >> 3, tc = tid & 7;  // rows 2tr, 2tr+1; columns 4tc..4tc+3
+    const int r0 = tr * 2, d0 = tc * 4;
+    float su[2][4] = {}, sw[2][4] = {};
+    for (int m = 0; m < r0 + 2; ++m) {
+      const float t[2] = {Ts[r0 * kLt + m], Ts[(r0 + 1) * kLt + m]};
+      const float4 v = ld4(Vs + m * kLp + d0), k = ld4(Ks + m * kLp + d0);
 #pragma unroll
-      for (int x = 0; x < 4; ++x) t[x] = Ts[(r0 + x) * kLt + m];
-      const float4 v = ld4(Vs + m * kLt + d0), k = ld4(Ks + m * kLt + d0);
-#pragma unroll
-      for (int x = 0; x < 4; ++x) {
+      for (int x = 0; x < 2; ++x) {
         su[x][0] += t[x] * v.x; su[x][1] += t[x] * v.y; su[x][2] += t[x] * v.z; su[x][3] += t[x] * v.w;
         sw[x][0] += t[x] * k.x; sw[x][1] += t[x] * k.y; sw[x][2] += t[x] * k.z; sw[x][3] += t[x] * k.w;
       }
     }
-    float* u = u_out + hc * kChunk * kDK + half * kHalf;
-    float* w = w_out + hc * kChunk * kDK + half * kHalf;
+    float* u = u_out + hc * kChunk * kDK + part * kPart;
+    float* w = w_out + hc * kChunk * kDK + part * kPart;
 #pragma unroll
-    for (int x = 0; x < 4; ++x) {
+    for (int x = 0; x < 2; ++x) {
       st4(u + (r0 + x) * kDK + d0, su[x][0], su[x][1], su[x][2], su[x][3]);
       st4(w + (r0 + x) * kDK + d0, sw[x][0], sw[x][1], sw[x][2], sw[x][3]);
     }
   }
 }
 
-constexpr size_t kPrepareSmem = sizeof(float) * (3 * kChunk * kLt + 6 * kChunk);
+constexpr size_t kPrepareSmem = sizeof(float) * (2 * kChunk * kLt + kChunk * kLp + 6 * kChunk);
 
 // ===================================================================== state
 // One block owns the state columns S[:, v0:v0+32] of one (head, sequence);
@@ -392,6 +391,98 @@ gdn_state_kernel(const float* __restrict__ kd, const float* __restrict__ u, cons
   }
 }
 
+// ==================================================================== output
+// One block per (chunk, head): o = qg @ S + aqk @ vnew as a 64x128 tile with
+// K = 128 + 64 (S = 0, and the first term vanishes, on a sequence's first
+// chunk), 4 rows x 8 columns per thread, K staged through smem 16 at a time.
+// kNorm: out[t, h*128 + :] = rmsnorm(o_row) * w * silu(z) in the activation
+// dtype; otherwise the raw fp32 o row.
+constexpr int kOutK = 16;
+template <typename T, bool kNorm>
+__global__ void __launch_bounds__(kThreads)
+gdn_output_kernel(const float* __restrict__ qg, const float* __restrict__ states, const float* __restrict__ aqk,
+                  const float* __restrict__ vnew, const int* __restrict__ chunk_start,
+                  const int* __restrict__ chunk_valid, const int* __restrict__ seq_start, int C, int cb,
+                  const T* __restrict__ z, int64_t ldz, const float* __restrict__ gw, float eps,
+                  void* __restrict__ out, int64_t ldo) {
+  const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+  const size_t hc = size_t(h) * C + c;
+  const int t0 = chunk_start[cb + c], nvalid = chunk_valid[cb + c];
+  const bool with_state = states != nullptr && seq_start[t0] != t0;
+
+  __shared__ __align__(16) float At[kOutK][kChunk + 4];  // A^T tile (k-major), padded
+  __shared__ __align__(16) float Bs[kOutK][kDK];
+  const int tr = tid >> 4, tc = tid & 15;  // rows 4tr.., columns 4tc.. and 64+4tc..
+  float acc[4][8] = {};
+
+  // K steps: [qg | aqk] x [S ; vnew]
+  const int k_begin = with_state ? 0 : kDK, k_end = kDK + kChunk;
+  const float* qg_t = qg + hc * kChunk * kDK;
+  const float* aqk_t = aqk + hc * kChunk * kChunk;
+  const float* s_t = with_state ? states + hc * kDK * kDK : nullptr;
+  const float* vn_t = vnew + hc * kChunk * kDK;
+  // global -> register staging: A 64x16 (one float4 per thread), B 16x128 (two)
+  const int ar = tid >> 2, ak = (tid & 3) * 4;
+  float4 ra, rb0, rb1;
+  auto fetch = [&](int k0) {
+    ra = k0 < kDK ? ld4(qg_t + ar * kDK + k0 + ak) : ld4(aqk_t + ar * kChunk + (k0 - kDK) + ak);
+    const float* bsrc = k0 < kDK ? s_t + size_t(k0) * kDK : vn_t + size_t(k0 - kDK) * kDK;
+    rb0 = ld4(bsrc + tid * 4);
+    rb1 = ld4(bsrc + (tid + kThreads) * 4);
+  };
+  fetch(k_begin);
+  for (int k0 = k_begin; k0 < k_end; k0 += kOutK) {
+    __syncthreads();
+    At[ak][ar] = ra.x, At[ak + 1][ar] = ra.y, At[ak + 2][ar] = ra.z, At[ak + 3][ar] = ra.w;
+    reinterpret_cast<float4*>(&Bs[0][0])[tid] = rb0;
+    reinterpret_cast<float4*>(&Bs[0][0])[tid + kThreads] = rb1;
+    __syncthreads();
+    if (k0 + kOutK < k_end) fetch(k0 + kOutK);
+#pragma unroll
+    for (int k = 0; k < kOutK; ++k) {
+      const float4 a = *reinterpret_cast<const float4*>(&At[k][tr * 4]);
+      const float4 b0 = *reinterpret_cast<const float4*>(&Bs[k][tc * 4]);
+      const float4 b1 = *reinterpret_cast<const float4*>(&Bs[k][64 + tc * 4]);
+      const float av[4] = {a.x, a.y, a.z, a.w}, bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][j] += av[i] * bv[j];
+    }
+  }
+
+  // epilogue: the 16 threads of a row group are lanes [0,16) or [16,32) of a warp
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int r = tr * 4 + i;
+    const int64_t t = t0 + r;
+    if constexpr (kNorm) {
+      float sq = 0.f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) sq += acc[i][j] * acc[i][j];
+#pragma unroll
+      for (int o = 8; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+      if (r >= nvalid) continue;
+      const float rs = rsqrtf(sq / kDK + eps);
+      T* op = static_cast<T*>(out) + t * ldo + h * kDK;
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const int col = half * 64 + tc * 4;
+        float zz[4], y[4];
+        load4(z + t * ldz + h * kDK + col, zz);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) y[j] = acc[i][half * 4 + j] * rs * gw[col + j] * siluf_(zz[j]);
+        store4(op + col, y);
+      }
+    } else {
+      if (r >= nvalid) continue;
+      float* op = static_cast<float*>(out) + t * ldo + h * kDK;
+      st4(op + tc * 4, acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+      st4(op + 64 + tc * 4, acc[i][4], acc[i][5], acc[i][6], acc[i][7]);
+    }
+  }
+}
+
 constexpr size_t state_smem(bool dbl) {
   return sizeof(float) * ((dbl ? 2 : 1) * kChunk * kDK + 8 * 16 * 32 + 2 * kChunk * kBV);
 }
@@ -402,8 +493,8 @@ static_assert(kPrepareSmem <= 65536, "prepare kernel must fit sm_75's 64 KB");
 
 // ================================================================ host side
 int64_t gdn_bytes_per_head_chunk(int64_t dk, int64_t dv) {
-  // qg, kd, w [64, dk]; u, vnew, o [64, dv]; aqk [64, 64]; states [dk, dv]; dl
-  return int64_t(sizeof(float)) * (kChunk * (3 * dk + 3 * dv + kChunk) + dk * dv + 1);
+  // qg, kd, w [64, dk]; u, vnew [64, dv]; aqk [64, 64]; states [dk, dv]; dl
+  return int64_t(sizeof(float)) * (kChunk * (3 * dk + 2 * dv + kChunk) + dk * dv + 1);
 }
 
 GdnChunks gdn_chunk_prepare(const at::Tensor& mixed, const at::Tensor& b, const at::Tensor& a,
@@ -445,8 +536,8 @@ GdnChunks gdn_chunk_prepare(const at::Tensor& mixed, const at::Tensor& b, const 
   return r;
 }
 
-at::Tensor gdn_chunk_recurrence(const GdnChunks& ch, const at::Tensor& chunk_offsets, int64_t num_seqs,
-                                int64_t chunk_begin, const at::Tensor& carry, bool allow_double_buffer) {
+GdnRecurrence gdn_chunk_recurrence(const GdnChunks& ch, const at::Tensor& chunk_offsets, int64_t num_seqs,
+                                   int64_t chunk_begin, const at::Tensor& carry, bool allow_double_buffer) {
   const int64_t H = ch.qg.size(0), C = ch.qg.size(1), DV = ch.u.size(3);
   WEMM_CHECK(ch.qg.size(2) == kChunk && ch.qg.size(3) == kDK && ch.w.size(3) == kDK && ch.kd.size(3) == kDK,
              "gdn kernel expects chunk 64 and key dim 128");
@@ -458,9 +549,11 @@ at::Tensor gdn_chunk_recurrence(const GdnChunks& ch, const at::Tensor& chunk_off
     WEMM_CHECK(carry.is_contiguous() && carry.numel() == H * num_seqs * kDK * DV, "gdn: bad carry buffer");
   else
     WEMM_CHECK(chunk_begin == 0, "gdn: a window after the first needs the carry buffer");
+  // Every sequence has at least one chunk, so C == num_seqs in a single window
+  // means one chunk each: S stays 0 and vnew == u, no recurrence to run.
+  if (chunk_begin == 0 && C == num_seqs && !carry.defined()) return {at::Tensor(), ch.u};
   c10::cuda::CUDAGuard guard(ch.qg.device());
-  at::Tensor states = at::empty({H, C, kDK, DV}, ch.qg.options());
-  at::Tensor vnew = at::empty({H, C, kChunk, DV}, ch.qg.options());
+  GdnRecurrence r{at::empty({H, C, kDK, DV}, ch.qg.options()), at::empty({H, C, kChunk, DV}, ch.qg.options())};
   if (C > 0) {
     const bool dbl = allow_double_buffer && device_has_cp_async() && max_smem_optin() >= int(state_smem(true));
     dim3 grid{unsigned(H), unsigned(num_seqs), unsigned(DV / kBV)};
@@ -468,18 +561,52 @@ at::Tensor gdn_chunk_recurrence(const GdnChunks& ch, const at::Tensor& chunk_off
       ensure_smem(kernel, smem);
       kernel<<<grid, kThreads, smem, at::cuda::getCurrentCUDAStream()>>>(
           ch.kd.data_ptr<float>(), ch.u.data_ptr<float>(), ch.w.data_ptr<float>(), ch.dl.data_ptr<float>(),
-          chunk_offsets.data_ptr<int>(), states.data_ptr<float>(), vnew.data_ptr<float>(), int(C), int(DV),
+          chunk_offsets.data_ptr<int>(), r.states.data_ptr<float>(), r.vnew.data_ptr<float>(), int(C), int(DV),
           int(chunk_begin), carry.defined() ? carry.data_ptr<float>() : nullptr, int(num_seqs));
     };
     if (dbl) launch(gdn_state_kernel<true>, state_smem(true));
     else launch(gdn_state_kernel<false>, state_smem(false));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  // Outputs are independent per chunk: o = qg @ S_c + aqk @ vnew (fp32 batched GEMMs).
-  at::Tensor o = at::empty({H * C, kChunk, DV}, ch.qg.options());
-  gemm_f32_batched(ch.qg.view({H * C, kChunk, kDK}), states.view({H * C, kDK, DV}), o, false);
-  gemm_f32_batched(ch.aqk.view({H * C, kChunk, kChunk}), vnew.view({H * C, kChunk, DV}), o, true);
-  return o.view({H, C, kChunk, DV});
+  return r;
+}
+
+void gdn_chunk_output(const GdnChunks& ch, const GdnRecurrence& rec, const at::Tensor& chunk_start,
+                      const at::Tensor& chunk_valid, const at::Tensor& seq_start, int64_t chunk_begin,
+                      const at::Tensor& z, const at::Tensor& w, double eps, at::Tensor& out) {
+  const int64_t H = ch.qg.size(0), C = ch.qg.size(1);
+  WEMM_CHECK(ch.u.size(3) == kDK, "gdn_chunk_output: value dim must be 128");
+  WEMM_CHECK(rec.vnew.is_contiguous() && rec.vnew.sizes() == ch.u.sizes(), "gdn_chunk_output: bad vnew");
+  WEMM_CHECK(!rec.states.defined() || (rec.states.is_contiguous() && rec.states.numel() == H * C * kDK * kDK),
+             "gdn_chunk_output: bad states");
+  WEMM_CHECK(out.dim() == 2 && out.stride(1) == 1 && out.size(1) == H * kDK && out.stride(0) % 4 == 0 &&
+                 out.size(0) == seq_start.numel(),
+             "gdn_chunk_output: out must be [L, H*128] with unit column stride");
+  WEMM_CHECK(chunk_begin + C <= chunk_start.numel(), "gdn_chunk_output: bad window");
+  if (C == 0) return;
+  c10::cuda::CUDAGuard guard(out.device());
+  const dim3 grid{unsigned(C), unsigned(H)};
+  const float* states = rec.states.defined() ? rec.states.data_ptr<float>() : nullptr;
+  auto launch = [&](auto kernel, const auto* zp, int64_t ldz, const float* wp) {
+    kernel<<<grid, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        ch.qg.data_ptr<float>(), states, ch.aqk.data_ptr<float>(), rec.vnew.data_ptr<float>(),
+        chunk_start.data_ptr<int>(), chunk_valid.data_ptr<int>(), seq_start.data_ptr<int>(), int(C),
+        int(chunk_begin), zp, ldz, wp, float(eps), out.data_ptr(), out.stride(0));
+  };
+  if (!z.defined()) {
+    WEMM_CHECK(out.scalar_type() == at::kFloat, "gdn_chunk_output: raw output must be fp32");
+    launch(gdn_output_kernel<float, false>, static_cast<const float*>(nullptr), 0, nullptr);
+  } else {
+    WEMM_CHECK(is_act(z) && z.stride(1) == 1 && z.stride(0) % 4 == 0 && z.size(1) == H * kDK &&
+                   z.size(0) == out.size(0) && out.scalar_type() == z.scalar_type(),
+               "gdn_chunk_output: bad z/out");
+    WEMM_CHECK(w.scalar_type() == at::kFloat && w.is_contiguous() && w.numel() == kDK, "gdn_chunk_output: bad w");
+    dispatch_act(z.scalar_type(), [&](auto tag) {
+      using T = decltype(tag);
+      launch(gdn_output_kernel<T, true>, ptr<T>(z), z.stride(0), w.data_ptr<float>());
+    });
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace wemm::kernels

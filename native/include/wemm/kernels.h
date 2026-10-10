@@ -64,23 +64,29 @@ GdnChunks gdn_chunk_prepare(const at::Tensor& mixed, const at::Tensor& b, const 
 
 // Inter-chunk recurrence (fp32). For each sequence, with S = 0 initially and
 // for its chunks c in order:
-//   vnew = u_c - w_c @ S;  o_c = qg_c @ S + aqk_c @ vnew;  S = S * dl_c + kd_c^T @ vnew
+//   S_c = S;  vnew_c = u_c - w_c @ S;  S = S * dl_c + kd_c^T @ vnew_c
 // The per-chunk tensors may cover only chunks [chunk_begin, chunk_begin + C)
 // of the packed batch (chunk_offsets [N+1] int32 is global); sequences that
 // continue past the window store/restore S in `carry` [H, N, dk, dv].
-// Returns o: [H, C, 64, dv] fp32. The state kernel double-buffers its tiles
-// with cp.async when the GPU allows (sm_80+, >= 96 KB smem); pass
-// allow_double_buffer=false to force the 64 KB single-buffer variant (sm_75).
-at::Tensor gdn_chunk_recurrence(const GdnChunks& ch, const at::Tensor& chunk_offsets, int64_t num_seqs,
-                                int64_t chunk_begin = 0, const at::Tensor& carry = at::Tensor(),
-                                bool allow_double_buffer = true);
+// The state kernel double-buffers its tiles with cp.async when the GPU allows
+// (sm_80+, >= 96 KB smem); allow_double_buffer=false forces the 64 KB
+// single-buffer variant (sm_75).
+struct GdnRecurrence {
+  at::Tensor states;  // [H, C, dk, dv] S_c; undefined when every chunk starts a sequence
+  at::Tensor vnew;    // [H, C, 64, dv]
+};
+GdnRecurrence gdn_chunk_recurrence(const GdnChunks& ch, const at::Tensor& chunk_offsets, int64_t num_seqs,
+                                   int64_t chunk_begin = 0, const at::Tensor& carry = at::Tensor(),
+                                   bool allow_double_buffer = true);
 
-// Gated RMSNorm of the delta-rule output: norm(o) * w * silu(z).
-// o: [H, C*64, dv] fp32 chunk rows, padded_row: [L] int32 (token -> chunk row
-// + row_offset), z: [L, H*dv] act view, out: [L, H*dv] act (may be a row
-// slice of a larger contiguous tensor).
-void gdn_gated_rmsnorm(const at::Tensor& o, const at::Tensor& padded_row, const at::Tensor& z, const at::Tensor& w,
-                       double eps, int64_t row_offset, at::Tensor& out);
+// Chunk outputs o_c = qg_c @ S_c + aqk_c @ vnew_c written to token rows
+// t = chunk_start[c] + i (i < chunk_valid[c]) of out [L, H*dv]. With z
+// defined, the gated RMSNorm norm(o) * w * silu(z) is applied and out has
+// z's activation dtype (z: [L, H*dv] view); otherwise out is the raw fp32 o.
+// seq_start: [L] int32 first token of each token's sequence.
+void gdn_chunk_output(const GdnChunks& ch, const GdnRecurrence& rec, const at::Tensor& chunk_start,
+                      const at::Tensor& chunk_valid, const at::Tensor& seq_start, int64_t chunk_begin,
+                      const at::Tensor& z, const at::Tensor& w, double eps, at::Tensor& out);
 
 // Bytes of fp32 workspace one (head, chunk) pair needs in the GDN path; used
 // to size chunk windows.

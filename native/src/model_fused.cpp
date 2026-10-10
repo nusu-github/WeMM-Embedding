@@ -92,13 +92,9 @@ at::Tensor WeMMModel::linear_attention_fused(const TextLayer& l, const at::Tenso
       const int64_t c1 = std::min(C, c0 + W);
       auto ch = kernels::gdn_chunk_prepare(mixed, b, a, l.neg_A, l.dt_bias, pk.chunk_start, pk.chunk_valid, Hk, Hv,
                                            dk, dv, c0, c1);
-      at::Tensor o = kernels::gdn_chunk_recurrence(ch, pk.chunk_off, N, c0, carry);
-      ch = {};
-      const int64_t t0 = pk.chunk_start_h[size_t(c0)];
-      const int64_t t1 = pk.chunk_start_h[size_t(c1 - 1)] + pk.chunk_valid_h[size_t(c1 - 1)];
-      at::Tensor out_rows = normed.narrow(0, t0, t1 - t0);
-      kernels::gdn_gated_rmsnorm(o.view({Hv, (c1 - c0) * kChunk, dv}), pk.padded_row.narrow(0, t0, t1 - t0),
-                                 z.narrow(0, t0, t1 - t0), l.gnorm_w, tc.rms_norm_eps, c0 * kChunk, out_rows);
+      const auto rec = kernels::gdn_chunk_recurrence(ch, pk.chunk_off, N, c0, carry);
+      kernels::gdn_chunk_output(ch, rec, pk.chunk_start, pk.chunk_valid, pk.seq_start, c0, z, l.gnorm_w,
+                                tc.rms_norm_eps, normed);
     }
   }
   if (last) {

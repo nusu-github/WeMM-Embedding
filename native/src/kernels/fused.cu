@@ -191,51 +191,51 @@ __global__ void vision_rope_generic_kernel(const T* __restrict__ qkv, const floa
 }
 
 // ---------------------------------------------------------- causal conv1d
-// 8 channels per thread; w: [C, K].
+// Each thread computes 8 channels x kConvRows consecutive tokens, sliding a
+// K-row window through registers (every input row is read once plus a K-1
+// halo); w: [C, K], so a thread's 8 x K weights are contiguous.
+constexpr int kConvRows = 8;
 template <typename T, int K>
 __global__ void conv1d_silu_kernel(const T* __restrict__ x, int64_t ldx, const float* __restrict__ w,
                                    const int* __restrict__ seq_start, T* __restrict__ out, int L, int C) {
   const int groups = C / 8;
   const int64_t gid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (gid >= int64_t(L) * groups) return;
-  const int t = int(gid / groups);
+  if (gid >= int64_t((L + kConvRows - 1) / kConvRows) * groups) return;
+  const int t0 = int(gid / groups) * kConvRows;
   const int c = int(gid % groups) * 8;
-  const int s0 = seq_start[t];
-  float acc[8] = {};
+  float wk[8][K];
 #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    const int tt = t - (K - 1) + k;
-    if (tt < s0) continue;
-    float v[8];
-    load8(x + int64_t(tt) * ldx + c, v);
+  for (int j = 0; j < 8; ++j)
 #pragma unroll
-    for (int j = 0; j < 8; ++j) acc[j] += v[j] * w[(c + j) * K + k];
+    for (int k = 0; k < K; k += 4) {
+      const float4 v = *reinterpret_cast<const float4*>(w + (c + j) * K + k);
+      wk[j][k] = v.x, wk[j][k + 1] = v.y, wk[j][k + 2] = v.z, wk[j][k + 3] = v.w;
+    }
+  float win[K][8];  // win[K-1] = current row, win[K-1-i] = row t-i
+#pragma unroll
+  for (int k = 0; k < K - 1; ++k) {
+    const int tt = t0 - (K - 1) + k;
+    if (tt >= 0) load8(x + int64_t(tt) * ldx + c, win[k + 1]);
   }
+  const int t1 = min(L, t0 + kConvRows);
+  for (int t = t0; t < t1; ++t) {
 #pragma unroll
-  for (int j = 0; j < 8; ++j) acc[j] = siluf_(acc[j]);
-  store8(out + int64_t(t) * C + c, acc);
-}
-
-// ------------------------------------------------------ gated rmsnorm (GDN)
-template <typename T>
-__global__ void gdn_gated_norm_kernel(const float* __restrict__ o, int64_t o_head_stride,
-                                      const int* __restrict__ padded_row, int row_offset, const T* __restrict__ z,
-                                      int64_t ldz, const float* __restrict__ w, T* __restrict__ out, int L, int H,
-                                      float eps) {
-  constexpr int VPT = 4, dv = VPT * 32;
-  const int64_t gw = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
-  const int lane = threadIdx.x & 31;
-  if (gw >= int64_t(L) * H) return;
-  const int t = int(gw / H), h = int(gw % H);
-  const float4 f = *reinterpret_cast<const float4*>(o + h * o_head_stride +
-                                                    int64_t(padded_row[t] - row_offset) * dv + lane * VPT);
-  const float r = rsqrtf(warp_sum(f.x * f.x + f.y * f.y + f.z * f.z + f.w * f.w) / dv + eps);
-  float zz[VPT];
-  load4(z + int64_t(t) * ldz + h * dv + lane * VPT, zz);
-  const float ff[VPT] = {f.x, f.y, f.z, f.w};
-  T* outp = out + (int64_t(t) * H + h) * dv + lane * VPT;
+    for (int k = 0; k < K - 1; ++k)
 #pragma unroll
-  for (int j = 0; j < VPT; ++j) outp[j] = from_f<T>(ff[j] * r * w[lane * VPT + j] * siluf_(zz[j]));
+      for (int j = 0; j < 8; ++j) win[k][j] = win[k + 1][j];
+    load8(x + int64_t(t) * ldx + c, win[K - 1]);
+    const int s0 = seq_start[t];
+    float acc[8] = {};
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      if (t - (K - 1) + k < s0) continue;  // rows of the previous sequence (or before 0)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[j] += win[k][j] * wk[j][k];
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = siluf_(acc[j]);
+    store8(out + int64_t(t) * C + c, acc);
+  }
 }
 
 int norm_threads(int64_t D) { return int(std::min<int64_t>(1024, std::max<int64_t>(32, ((D / 8 + 31) / 32) * 32))); }
@@ -402,34 +402,12 @@ at::Tensor causal_conv1d_silu(const at::Tensor& x, const at::Tensor& w, const at
   const int block = 256;
   dispatch_act(x.scalar_type(), [&](auto tag) {
     using T = decltype(tag);
-    conv1d_silu_kernel<T, 4><<<blocks_for(int64_t(L) * (C / 8), block), block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    conv1d_silu_kernel<T, 4><<<blocks_for(int64_t((L + kConvRows - 1) / kConvRows) * (C / 8), block), block, 0, at::cuda::getCurrentCUDAStream()>>>(
         ptr<T>(x), x.stride(0), w.data_ptr<float>(), seq_start.data_ptr<int>(), ptr<T>(out), L, C);
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
-void gdn_gated_rmsnorm(const at::Tensor& o, const at::Tensor& padded_row, const at::Tensor& z, const at::Tensor& w,
-                       double eps, int64_t row_offset, at::Tensor& out) {
-  WEMM_CHECK(o.dim() == 3 && o.is_contiguous() && o.scalar_type() == at::kFloat, "gated_norm: bad o");
-  const int64_t H = o.size(0), dv = o.size(2), L = padded_row.numel();
-  WEMM_CHECK(dv == 128, "gated_norm: dv must be 128");
-  WEMM_CHECK(is_act(z) && z.stride(1) == 1 && z.size(1) == H * dv && z.size(0) == L, "gated_norm: bad z");
-  WEMM_CHECK(out.scalar_type() == z.scalar_type() && out.size(0) == L && out.size(1) == H * dv &&
-                 out.stride(0) == H * dv && out.stride(1) == 1,
-             "gated_norm: bad out");
-  WEMM_CHECK(padded_row.scalar_type() == at::kInt && w.scalar_type() == at::kFloat && w.numel() == dv,
-             "gated_norm: bad padded_row/weight");
-  if (L == 0) return;
-  c10::cuda::CUDAGuard guard(o.device());
-  const int block = 256;
-  dispatch_act(z.scalar_type(), [&](auto tag) {
-    using T = decltype(tag);
-    gdn_gated_norm_kernel<T><<<blocks_for(L * H * 32, block), block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        o.data_ptr<float>(), o.stride(0), padded_row.data_ptr<int>(), int(row_offset), ptr<T>(z), z.stride(0),
-        w.data_ptr<float>(), ptr<T>(out), int(L), int(H), float(eps));
-  });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
 
 }  // namespace wemm::kernels
