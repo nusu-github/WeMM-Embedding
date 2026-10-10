@@ -37,6 +37,7 @@ static void write_npy(const std::string& path, const at::Tensor& t) {
 int main(int argc, char** argv) {
   std::string model, output;
   std::optional<int64_t> dim;
+  int repeat = 1;
   std::vector<Conversation> inputs;
   EmbedderOptions opts;
   try {
@@ -51,6 +52,7 @@ int main(int argc, char** argv) {
       else if (a == "--output") output = next();
       else if (a == "--batch-tokens") opts.max_batch_tokens = std::stoll(next());
       else if (a == "--threads") opts.preprocess_threads = std::stoi(next());
+      else if (a == "--repeat") repeat = std::max(1, std::stoi(next()));  // timing: report the last run
       else if (a == "--device") opts.model.device_index = std::stoi(next());
       else if (a == "--text") inputs.push_back(text_conversation(next()));
       else if (a == "--image") inputs.push_back(image_conversation(next()));
@@ -75,11 +77,15 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     Embedder emb(model, opts);
     auto t1 = std::chrono::steady_clock::now();
-    at::Tensor out = emb.embed(inputs, dim);
+    at::Tensor out;
+    for (int r = 0; r < repeat; ++r) {
+      t1 = std::chrono::steady_clock::now();
+      out = emb.embed(inputs, dim);
+    }
     auto t2 = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "loaded in %.2fs, embedded %zu inputs in %.3fs\n",
-                 std::chrono::duration<double>(t1 - t0).count(), inputs.size(),
-                 std::chrono::duration<double>(t2 - t1).count());
+    const double secs = std::chrono::duration<double>(t2 - t1).count();
+    std::fprintf(stderr, "loaded in %.2fs, embedded %zu inputs in %.3fs (%.1f inputs/s)\n",
+                 std::chrono::duration<double>(t1 - t0).count(), inputs.size(), secs, inputs.size() / secs);
 
     if (output.size() > 4 && output.substr(output.size() - 4) == ".npy") {
       write_npy(output, out);

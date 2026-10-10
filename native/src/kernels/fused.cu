@@ -313,6 +313,27 @@ __global__ void vision_rope_kernel(const bf16* __restrict__ qkv, const float* __
   for (int j = 0; j < VPT; ++j) dst[j] = __float2bfloat16(first ? f[j] * c[j] - g[j] * s[j] : f[j] * c[j] + g[j] * s[j]);
 }
 
+// Generic head_dim: one thread per rotate_half pair (i, i + hd/2) of q or k.
+__global__ void vision_rope_generic_kernel(const bf16* __restrict__ qkv, const float* __restrict__ cos,
+                                           const float* __restrict__ sin, bf16* __restrict__ q_out,
+                                           bf16* __restrict__ k_out, int P, int nh, int hd) {
+  const int half = hd / 2;
+  const int64_t gid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (gid >= int64_t(P) * nh * 2 * half) return;
+  const int i = int(gid % half);
+  int64_t rest = gid / half;
+  const int which = int(rest % 2);
+  rest /= 2;
+  const int h = int(rest % nh), p = int(rest / nh);
+  const bf16* src = qkv + int64_t(p) * 3 * nh * hd + int64_t(which) * nh * hd + int64_t(h) * hd;
+  const float x1 = __bfloat162float(src[i]), x2 = __bfloat162float(src[i + half]);
+  const float* c = cos + int64_t(p) * hd;
+  const float* s = sin + int64_t(p) * hd;
+  bf16* dst = (which ? k_out : q_out) + (int64_t(p) * nh + h) * hd;
+  dst[i] = __float2bfloat16(x1 * c[i] - x2 * s[i]);
+  dst[i + half] = __float2bfloat16(x2 * c[i + half] + x1 * s[i + half]);
+}
+
 inline unsigned blocks_for(int64_t threads_total, int block) { return unsigned((threads_total + block - 1) / block); }
 
 }  // namespace
@@ -434,11 +455,18 @@ std::pair<at::Tensor, at::Tensor> vision_qk_rope(const at::Tensor& qkv, const at
                                                  int64_t nh) {
   WEMM_CHECK(qkv.is_contiguous() && qkv.scalar_type() == at::kBFloat16, "vision_rope: bad qkv");
   const int64_t P = qkv.size(0), hd = qkv.size(1) / 3 / nh;
-  WEMM_CHECK(hd == 64 && cos.size(1) == hd && cos.is_contiguous() && sin.is_contiguous(),
-             "vision_rope: head_dim must be 64");
+  WEMM_CHECK(hd % 2 == 0 && cos.size(1) == hd && cos.is_contiguous() && sin.is_contiguous(),
+             "vision_rope: bad rotary tables");
   at::Tensor q = at::empty({P, nh, hd}, qkv.options()), k = at::empty({P, nh, hd}, qkv.options());
   if (P == 0) return {q, k};
   const int block = 256;
+  if (hd != 64) {
+    vision_rope_generic_kernel<<<blocks_for(P * nh * hd, block), block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const bf16*>(qkv.data_ptr()), cos.data_ptr<float>(), sin.data_ptr<float>(),
+        reinterpret_cast<bf16*>(q.data_ptr()), reinterpret_cast<bf16*>(k.data_ptr()), int(P), int(nh), int(hd));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {q, k};
+  }
   vision_rope_kernel<2><<<blocks_for(P * nh * 2 * 32, block), block, 0, at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const bf16*>(qkv.data_ptr()), cos.data_ptr<float>(), sin.data_ptr<float>(),
       reinterpret_cast<bf16*>(q.data_ptr()), reinterpret_cast<bf16*>(k.data_ptr()), int(P), int(nh));

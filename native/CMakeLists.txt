@@ -18,6 +18,7 @@ set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
 # LibTorch: point CMAKE_PREFIX_PATH (or Torch_DIR) at an unpacked libtorch
 # (cu130 build) or at `python -c 'import torch; print(torch.utils.cmake_prefix_path)'`.
 find_package(Torch REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(nlohmann_json 3.10 REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -50,13 +51,14 @@ add_library(wemm SHARED
   src/model.cpp
   src/gemm.cpp
   src/embedder.cpp
+  src/c_api.cpp
   src/kernels/gdn.cu
   src/kernels/fused.cu
 )
 target_include_directories(wemm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(wemm
   PUBLIC ${TORCH_LIBRARIES}
-  PRIVATE nlohmann_json::nlohmann_json ${OpenCV_LIBS} PkgConfig::FFMPEG wemm_tokenizers dl pthread)
+  PRIVATE nlohmann_json::nlohmann_json ${OpenCV_LIBS} PkgConfig::FFMPEG CUDA::cublasLt wemm_tokenizers dl pthread)
 target_compile_options(wemm PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wno-unused-function>
   $<$<COMPILE_LANGUAGE:CUDA>:-O3 --expt-relaxed-constexpr -lineinfo>)
@@ -76,3 +78,6 @@ target_link_libraries(wemm_bench_gemm PRIVATE wemm)
 
 add_executable(wemm_bench_gdn tests/bench_gdn.cpp)
 target_link_libraries(wemm_bench_gdn PRIVATE wemm)
+
+add_executable(wemm_test_c_api tests/test_c_api.c)
+target_link_libraries(wemm_test_c_api PRIVATE wemm m)

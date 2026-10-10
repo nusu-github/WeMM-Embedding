@@ -49,6 +49,18 @@ struct Plan {
 };
 
 std::mutex g_mu;
+
+// Our own cuBLASLt handle: LibTorch distributions may bundle a privately named
+// cuBLASLt, so a handle obtained from ATen must not be mixed with the library
+// this file links against.
+cublasLtHandle_t lt_handle() {
+  static cublasLtHandle_t h = [] {
+    cublasLtHandle_t x;
+    LT_CHECK(cublasLtCreate(&x));
+    return x;
+  }();
+  return h;
+}
 std::unordered_map<Key, Plan, KeyHash> g_plans;
 // Autotuned algorithms, keyed by the plan key with M rounded to a bucket so
 // that varying token counts reuse one tuning result.
@@ -129,7 +141,7 @@ at::Tensor gemm(const at::Tensor& x, const at::Tensor& w, const std::optional<at
       constexpr int kMaxAlgos = 8;
       cublasLtMatmulHeuristicResult_t res[kMaxAlgos]{};
       int n_res = 0;
-      LT_CHECK(cublasLtMatmulAlgoGetHeuristic(at::cuda::getCurrentCUDABlasLtHandle(), p.op, p.a, p.b, p.c, p.c, pref,
+      LT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_handle(), p.op, p.a, p.b, p.c, p.c, pref,
                                               autotune_enabled() ? kMaxAlgos : 1, res, &n_res));
       cublasLtMatmulPreferenceDestroy(pref);
       WEMM_CHECK(n_res > 0, "gemm: no cuBLASLt algorithm for M=", M, " N=", N, " K=", K);
@@ -141,7 +153,7 @@ at::Tensor gemm(const at::Tensor& x, const at::Tensor& w, const std::optional<at
         bool reused = false;
         if (tuned != g_tuned.end()) {
           cublasLtMatmulHeuristicResult_t chk{};
-          if (cublasLtMatmulAlgoCheck(at::cuda::getCurrentCUDABlasLtHandle(), p.op, p.a, p.b, p.c, p.c,
+          if (cublasLtMatmulAlgoCheck(lt_handle(), p.op, p.a, p.b, p.c, p.c,
                                       &tuned->second, &chk) == CUBLAS_STATUS_SUCCESS &&
               chk.workspaceSize <= kWorkspace) {
             p.algo = tuned->second;
@@ -165,7 +177,7 @@ at::Tensor gemm(const at::Tensor& x, const at::Tensor& w, const std::optional<at
           for (int i = 0; i < n_res; ++i) {
             if (res[i].state != CUBLAS_STATUS_SUCCESS || res[i].workspaceSize > kWorkspace) continue;
             auto run = [&] {
-              return cublasLtMatmul(at::cuda::getCurrentCUDABlasLtHandle(), p.op, &one, w.data_ptr(), p.a,
+              return cublasLtMatmul(lt_handle(), p.op, &one, w.data_ptr(), p.a,
                                     x.data_ptr(), p.b, residual ? &one : &zero,
                                     residual ? residual->data_ptr() : scratch.data_ptr(), p.c, scratch.data_ptr(), p.c,
                                     &res[i].algo, ws.data_ptr(), kWorkspace, stream);
@@ -200,7 +212,7 @@ at::Tensor gemm(const at::Tensor& x, const at::Tensor& w, const std::optional<at
              "gemm: x must be 16-byte aligned");
   const float alpha = 1.f, beta = residual ? 1.f : 0.f;
   at::Tensor ws = at::empty({int64_t(kWorkspace)}, x.options().dtype(at::kByte));
-  LT_CHECK(cublasLtMatmul(at::cuda::getCurrentCUDABlasLtHandle(), plan->op, &alpha, w.data_ptr(), plan->a,
+  LT_CHECK(cublasLtMatmul(lt_handle(), plan->op, &alpha, w.data_ptr(), plan->a,
                           x.data_ptr(), plan->b, &beta, residual ? residual->data_ptr() : y.data_ptr(), plan->c,
                           y.data_ptr(), plan->c, &plan->algo, ws.data_ptr(), kWorkspace,
                           at::cuda::getCurrentCUDAStream()));
@@ -231,7 +243,7 @@ void gemm_f32_batched(const at::Tensor& a, const at::Tensor& b, at::Tensor& out,
   }
   const float alpha = 1.f, beta = accumulate ? 1.f : 0.f;
   at::Tensor ws = at::empty({int64_t(kWorkspace)}, a.options().dtype(at::kByte));
-  LT_CHECK(cublasLtMatmul(at::cuda::getCurrentCUDABlasLtHandle(), op, &alpha, b.data_ptr(), la, a.data_ptr(), lb,
+  LT_CHECK(cublasLtMatmul(lt_handle(), op, &alpha, b.data_ptr(), la, a.data_ptr(), lb,
                           &beta, out.data_ptr(), lc, out.data_ptr(), lc, nullptr, ws.data_ptr(), kWorkspace,
                           at::cuda::getCurrentCUDAStream()));
   cublasLtMatrixLayoutDestroy(la);
