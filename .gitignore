@@ -60,3 +60,5 @@ htmlcov/
 
 # Wheels
 *.whl
+native/build/
+native/tokenizers-ffi/target/
