@@ -86,17 +86,20 @@ void WeMMModel::load_weights(const std::string& model_dir) {
   };
   auto act = [&](const std::string& n) { return up(st.get(n), act_); };
   auto f32 = [&](const std::string& n) { return up(st.get(n), at::kFloat); };
-  auto act_cat = [&](std::vector<at::Tensor> parts, int64_t pad_rows_to = 1) {
+  // GEMM weight matrices (optionally compressed)
+  auto mat_host = [&](const at::Tensor& host) { return Weight::load(host, act_, device_, opts_.compress_weights); };
+  auto mat = [&](const std::string& n) { return mat_host(st.get(n)); };
+  auto mat_cat = [&](std::vector<at::Tensor> parts, int64_t pad_rows_to = 1) {
     at::Tensor t = at::cat(parts, 0);
     const int64_t rows = t.size(0), padded = (rows + pad_rows_to - 1) / pad_rows_to * pad_rows_to;
     if (padded != rows) t = at::cat({t, at::zeros({padded - rows, t.size(1)}, t.options())}, 0);
-    return up(t, act_);
+    return mat_host(t);
   };
 
   // ---------------------------------------------------------------- vision
   const auto& vc = cfg_.vision;
   const std::string vp = "model.visual.";
-  patch_w = act(vp + "patch_embed.proj.weight").reshape({vc.hidden_size, -1}).contiguous();
+  patch_w = mat_host(st.get(vp + "patch_embed.proj.weight").reshape({vc.hidden_size, -1}));
   patch_b = f32(vp + "patch_embed.proj.bias");
   pos_embed = act(vp + "pos_embed.weight");
   for (int i = 0; i < vc.depth; ++i) {
@@ -106,21 +109,21 @@ void WeMMModel::load_weights(const std::string& model_dir) {
     b.norm1_b = f32(p + "norm1.bias");
     b.norm2_w = f32(p + "norm2.weight");
     b.norm2_b = f32(p + "norm2.bias");
-    b.qkv_w = act(p + "attn.qkv.weight");
+    b.qkv_w = mat(p + "attn.qkv.weight");
     b.qkv_b = act(p + "attn.qkv.bias");
-    b.proj_w = act(p + "attn.proj.weight");
+    b.proj_w = mat(p + "attn.proj.weight");
     b.proj_b = up(st.get(p + "attn.proj.bias"), resid_);
-    b.fc1_w = act(p + "mlp.linear_fc1.weight");
+    b.fc1_w = mat(p + "mlp.linear_fc1.weight");
     b.fc1_b = act(p + "mlp.linear_fc1.bias");
-    b.fc2_w = act(p + "mlp.linear_fc2.weight");
+    b.fc2_w = mat(p + "mlp.linear_fc2.weight");
     b.fc2_b = up(st.get(p + "mlp.linear_fc2.bias"), resid_);
     vblocks_.push_back(std::move(b));
   }
   merger_norm_w = f32(vp + "merger.norm.weight");
   merger_norm_b = f32(vp + "merger.norm.bias");
-  merger_fc1_w = act(vp + "merger.linear_fc1.weight");
+  merger_fc1_w = mat(vp + "merger.linear_fc1.weight");
   merger_fc1_b = act(vp + "merger.linear_fc1.bias");
-  merger_fc2_w = act(vp + "merger.linear_fc2.weight");
+  merger_fc2_w = mat(vp + "merger.linear_fc2.weight");
   merger_fc2_b = act(vp + "merger.linear_fc2.bias");
   {
     const int64_t dim = vc.hidden_size / vc.num_heads / 2;  // Qwen3_5VisionRotaryEmbedding(head_dim // 2)
@@ -141,23 +144,23 @@ void WeMMModel::load_weights(const std::string& model_dir) {
     if (l.linear) {
       const std::string a = p + "linear_attn.";
       // One GEMM for [qkv | z | b | a], padded to 128 outputs (faster tiles).
-      l.in_proj = act_cat({st.get(a + "in_proj_qkv.weight"), st.get(a + "in_proj_z.weight"),
+      l.in_proj = mat_cat({st.get(a + "in_proj_qkv.weight"), st.get(a + "in_proj_z.weight"),
                            st.get(a + "in_proj_b.weight"), st.get(a + "in_proj_a.weight")},
                           128);
       l.conv_w = f32(a + "conv1d.weight").squeeze(1).contiguous();
       l.neg_A = -f32(a + "A_log").exp();
       l.dt_bias = f32(a + "dt_bias");
       l.gnorm_w = f32(a + "norm.weight");
-      l.out_proj = act(a + "out_proj.weight");
+      l.out_proj = mat(a + "out_proj.weight");
     } else {
       const std::string a = p + "self_attn.";
-      l.qkv_proj = act_cat({st.get(a + "q_proj.weight"), st.get(a + "k_proj.weight"), st.get(a + "v_proj.weight")});
+      l.qkv_proj = mat_cat({st.get(a + "q_proj.weight"), st.get(a + "k_proj.weight"), st.get(a + "v_proj.weight")});
       l.q_norm = 1.0 + f32(a + "q_norm.weight");
       l.k_norm = 1.0 + f32(a + "k_norm.weight");
-      l.o_proj = act(a + "o_proj.weight");
+      l.o_proj = mat(a + "o_proj.weight");
     }
-    l.gate_up = act_cat({st.get(p + "mlp.gate_proj.weight"), st.get(p + "mlp.up_proj.weight")});
-    l.down = act(p + "mlp.down_proj.weight");
+    l.gate_up = mat_cat({st.get(p + "mlp.gate_proj.weight"), st.get(p + "mlp.up_proj.weight")});
+    l.down = mat(p + "mlp.down_proj.weight");
     layers_.push_back(std::move(l));
   }
   final_norm = 1.0 + f32(tp + "norm.weight");
@@ -240,19 +243,18 @@ WeMMModel::VisionPrelude WeMMModel::make_vision_prelude(const std::vector<std::a
   }
 
   // Interpolated position embeddings, summed in fp32.
+  Upload up;
+  for (int i = 0; i < 4; ++i) up.add(idx[i]).add(wts[i]);
+  const auto dev = up.add(rows).add(cols).add(cu).to(device_);
   vp.pos_embeds = at::zeros({P, D}, pos_embed.options().dtype(at::kFloat));
-  for (int i = 0; i < 4; ++i) {
-    at::Tensor ii = to_device_i64(idx[i], device_);
-    at::Tensor ww = at::tensor(at::ArrayRef<float>(wts[i])).to(device_);
-    vp.pos_embeds += pos_embed.index_select(0, ii).to(at::kFloat) * ww.unsqueeze(1);
-  }
-  at::Tensor rf = at::tensor(at::ArrayRef<float>(rows)).to(device_);
-  at::Tensor cf = at::tensor(at::ArrayRef<float>(cols)).to(device_);
+  for (int i = 0; i < 4; ++i)
+    vp.pos_embeds += pos_embed.index_select(0, dev[size_t(2 * i)]).to(at::kFloat) * dev[size_t(2 * i + 1)].unsqueeze(1);
+  const at::Tensor &rf = dev[8], &cf = dev[9];
   at::Tensor emb = at::cat({rf.unsqueeze(1) * vision_inv_freq, cf.unsqueeze(1) * vision_inv_freq}, 1);
   emb = at::cat({emb, emb}, 1);  // [P, head_dim]
   vp.cos = emb.cos();
   vp.sin = emb.sin();
-  vp.cu_seqlens = to_device_i32(cu, device_);
+  vp.cu_seqlens = dev[10];
   return vp;
 }
 
@@ -279,23 +281,36 @@ WeMMModel::Packing WeMMModel::make_packing(const std::vector<int64_t>& seq_lens,
     last.push_back(cu.back() - 1);
     pk.max_len = std::max(pk.max_len, len);
   }
-  pk.cu_seqlens = to_device_i32(cu, device_);
-  pk.seq_start = to_device_i32(seq_start, device_);
-  pk.last_rows = to_device_i64(last, device_);
-  pk.chunk_start = to_device_i32(pk.chunk_start_h, device_);
-  pk.chunk_valid = to_device_i32(pk.chunk_valid_h, device_);
-  pk.chunk_off = to_device_i32(pk.chunk_off_h, device_);
-  pk.padded_row = to_device_i32(padded_row, device_);
-
-  // Interleaved M-RoPE (T/H/W sections), fp32.
   const int64_t L = cu.back();
-  at::Tensor pos = position_ids.to(device_).to(at::kFloat);  // [3, L]
-  at::Tensor freqs = pos.unsqueeze(-1) * text_inv_freq;      // [3, L, R/2]
   const int64_t half = text_inv_freq.size(0);
   std::vector<int64_t> sel(size_t(half), 0);
   for (int dim = 1; dim <= 2; ++dim)
     for (int64_t j = dim; j < tc.mrope_section[size_t(dim)] * 3 && j < half; j += 3) sel[size_t(j)] = dim;
-  at::Tensor sel_t = to_device_i64(sel, device_).view({1, 1, half}).expand({1, L, half});
+  const at::Tensor pos_h = position_ids.to(at::kCPU, at::kLong).contiguous();
+  WEMM_CHECK(pos_h.numel() == 3 * L, "position_ids must be [3, L]");
+  const auto dev = Upload()
+                       .add(cu)
+                       .add(seq_start)
+                       .add(last)
+                       .add(pk.chunk_start_h)
+                       .add(pk.chunk_valid_h)
+                       .add(pk.chunk_off_h)
+                       .add(padded_row)
+                       .add(sel)
+                       .add(pos_h.data_ptr<int64_t>(), pos_h.numel())
+                       .to(device_);
+  pk.cu_seqlens = dev[0];
+  pk.seq_start = dev[1];
+  pk.last_rows = dev[2];
+  pk.chunk_start = dev[3];
+  pk.chunk_valid = dev[4];
+  pk.chunk_off = dev[5];
+  pk.padded_row = dev[6];
+
+  // Interleaved M-RoPE (T/H/W sections), fp32.
+  at::Tensor pos = dev[8].view({3, L}).to(at::kFloat);   // [3, L]
+  at::Tensor freqs = pos.unsqueeze(-1) * text_inv_freq;  // [3, L, R/2]
+  at::Tensor sel_t = dev[7].view({1, 1, half}).expand({1, L, half});
   freqs = freqs.gather(0, sel_t).squeeze(0);  // [L, R/2]
   at::Tensor emb = at::cat({freqs, freqs}, -1);
   pk.cos = emb.cos();
@@ -304,8 +319,8 @@ WeMMModel::Packing WeMMModel::make_packing(const std::vector<int64_t>& seq_lens,
 }
 
 at::Tensor WeMMModel::lookup_embeddings(const std::vector<int64_t>& ids) const {
-  at::Tensor ids_cpu = at::tensor(at::ArrayRef<int64_t>(ids), at::kLong);
-  if (embed_tokens.is_cuda()) return embed_tokens.index_select(0, ids_cpu.to(device_));
+  if (embed_tokens.is_cuda()) return embed_tokens.index_select(0, Upload().add(ids).to(device_)[0]);
+  at::Tensor ids_cpu = at::from_blob(const_cast<int64_t*>(ids.data()), {int64_t(ids.size())}, at::kLong);
   // Gather the rows on the host into pinned memory, then one async copy.
   at::Tensor rows = at::empty({int64_t(ids.size()), embed_tokens.size(1)},
                               at::TensorOptions().dtype(embed_tokens.scalar_type()).pinned_memory(true));
@@ -351,10 +366,12 @@ at::Tensor WeMMModel::embed(const std::vector<ProcessedSample>& batch) {
   if (!pixels.empty()) {
     at::Tensor feats = vision_forward(at::cat(pixels, 0), grids);
     pixels.clear();
-    at::Tensor ids_t = to_device_i64(ids, device_);
-    at::Tensor where = (ids_t == cfg_.image_token_id).logical_or_(ids_t == cfg_.video_token_id).nonzero().squeeze(1);
-    WEMM_CHECK(where.size(0) == feats.size(0), "vision tokens (", where.size(0), ") != features (", feats.size(0), ")");
-    h.index_copy_(0, where, feats.to(h.scalar_type()));
+    std::vector<int64_t> where;  // rows of the vision placeholder tokens
+    for (size_t i = 0; i < ids.size(); ++i)
+      if (ids[i] == cfg_.image_token_id || ids[i] == cfg_.video_token_id) where.push_back(int64_t(i));
+    WEMM_CHECK(int64_t(where.size()) == feats.size(0), "vision tokens (", where.size(), ") != features (",
+               feats.size(0), ")");
+    h.index_copy_(0, Upload().add(where).to(device_)[0], feats.to(h.scalar_type()));
   }
   at::Tensor out = text_forward(std::move(h), at::cat(pos, 1), seq_lens);
   WEMM_CHECK(at::isfinite(out).all().item<bool>(), "non-finite embedding",

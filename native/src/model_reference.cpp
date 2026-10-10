@@ -35,23 +35,23 @@ at::Tensor WeMMModel::vision_reference(const at::Tensor& pixel_values, const Vis
   const auto& vc = cfg_.vision;
   const int64_t m = vc.spatial_merge_size, D = vc.hidden_size, nh = vc.num_heads, hd = D / nh;
   const int64_t P = pixel_values.size(0);
-  at::Tensor x = at::linear(pixel_values.to(act_), patch_w, patch_b.to(act_));  // Conv3d == linear
+  at::Tensor x = at::linear(pixel_values.to(act_), patch_w.dense(), patch_b.to(act_));  // Conv3d == linear
   x = (x.to(at::kFloat) + vp.pos_embeds).to(act_);
   at::Tensor cos = vp.cos.unsqueeze(1), sin = vp.sin.unsqueeze(1);
   for (const auto& b : vblocks_) {
     at::Tensor y = ref_layernorm(x, b.norm1_w, b.norm1_b, act_);
-    at::Tensor qkv = at::linear(y, b.qkv_w, b.qkv_b).view({P, 3, nh, hd});
+    at::Tensor qkv = at::linear(y, b.qkv_w.dense(), b.qkv_b).view({P, 3, nh, hd});
     at::Tensor q = qkv.select(1, 0).to(at::kFloat), k = qkv.select(1, 1).to(at::kFloat);
     q = (q * cos + ref_rotate_half(q) * sin).to(act_);
     k = (k * cos + ref_rotate_half(k) * sin).to(act_);
     at::Tensor v = qkv.select(1, 2).contiguous();
     at::Tensor o = attention(q, k, v, vp.cu_seqlens, vp.cu_seqlens, vp.max_len, vp.max_len, false);
-    x = x + at::linear(o.reshape({P, D}), b.proj_w, b.proj_b.to(act_));
+    x = x + at::linear(o.reshape({P, D}), b.proj_w.dense(), b.proj_b.to(act_));
     y = ref_layernorm(x, b.norm2_w, b.norm2_b, act_);
-    x = x + at::linear(at::gelu(at::linear(y, b.fc1_w, b.fc1_b), "tanh"), b.fc2_w, b.fc2_b.to(act_));
+    x = x + at::linear(at::gelu(at::linear(y, b.fc1_w.dense(), b.fc1_b), "tanh"), b.fc2_w.dense(), b.fc2_b.to(act_));
   }
   at::Tensor y = ref_layernorm(x, merger_norm_w, merger_norm_b, act_).view({P / (m * m), D * m * m});
-  return at::linear(at::gelu(at::linear(y, merger_fc1_w, merger_fc1_b)), merger_fc2_w, merger_fc2_b);
+  return at::linear(at::gelu(at::linear(y, merger_fc1_w.dense(), merger_fc1_b)), merger_fc2_w.dense(), merger_fc2_b);
 }
 
 // ===================================================================== LM ====
@@ -70,10 +70,10 @@ at::Tensor WeMMModel::text_reference(at::Tensor h, const Packing& pk) {
     }
     if (last) h = h.index_select(0, pk.last_rows);  // only the <embedding> rows are needed from here on
     h = h + mix;
-    at::Tensor gu = at::linear(ref_rmsnorm(h, l.post_norm, tc.rms_norm_eps, act_), l.gate_up);
+    at::Tensor gu = at::linear(ref_rmsnorm(h, l.post_norm, tc.rms_norm_eps, act_), l.gate_up.dense());
     const int64_t I = gu.size(1) / 2;
     at::Tensor act = (at::silu(gu.narrow(1, 0, I).to(at::kFloat)) * gu.narrow(1, I, I).to(at::kFloat)).to(act_);
-    h = h + at::linear(act, l.down);
+    h = h + at::linear(act, l.down.dense());
   }
   return ref_rmsnorm(h, final_norm, tc.rms_norm_eps, at::kFloat);
 }
@@ -85,7 +85,7 @@ at::Tensor WeMMModel::linear_attention_reference(const TextLayer& l, const at::T
   const int64_t dk = tc.linear_key_head_dim, dv = tc.linear_value_head_dim;
   const int64_t key_dim = Hk * dk, value_dim = Hv * dv, conv_dim = 2 * key_dim + value_dim;
 
-  at::Tensor proj = at::linear(x, l.in_proj);
+  at::Tensor proj = at::linear(x, l.in_proj.dense());
   // Per-sequence depthwise causal conv in fp32, single rounding.
   at::Tensor xs = proj.narrow(1, 0, conv_dim).to(at::kFloat);
   std::vector<at::Tensor> outs;
@@ -114,7 +114,7 @@ at::Tensor WeMMModel::linear_attention_reference(const TextLayer& l, const at::T
   // Qwen3_5RMSNormGated: norm(o) * w * silu(z)
   at::Tensor zf = z.reshape({L, Hv, dv}).to(at::kFloat);
   o = o * at::rsqrt(o.pow(2).mean(-1, true) + tc.rms_norm_eps) * l.gnorm_w * at::silu(zf);
-  return at::linear(o.reshape({L, value_dim}).to(act_), l.out_proj);
+  return at::linear(o.reshape({L, value_dim}).to(act_), l.out_proj.dense());
 }
 
 // Chunked algorithm of torch_chunk_gated_delta_rule (fp32), batched over all
@@ -127,7 +127,7 @@ at::Tensor WeMMModel::gated_delta_rule_reference(const at::Tensor& q, const at::
   std::vector<int64_t> gather(size_t(C * kChunk), L);
   for (int64_t c = 0; c < C; ++c)
     for (int64_t j = 0; j < pk.chunk_valid_h[size_t(c)]; ++j) gather[size_t(c * kChunk + j)] = pk.chunk_start_h[size_t(c)] + j;
-  at::Tensor gidx = to_device_i64(gather, device_);
+  at::Tensor gidx = Upload().add(gather).to(device_)[0];
 
   auto l2norm = [](const at::Tensor& x) {
     at::Tensor xf = x.to(at::kFloat);
@@ -180,7 +180,7 @@ at::Tensor WeMMModel::full_attention_reference(const TextLayer& l, const at::Ten
   const auto& tc = cfg_.text;
   const int64_t L = x.size(0), H = tc.num_attention_heads, Hkv = tc.num_key_value_heads, hd = tc.head_dim;
   const int64_t rot = pk.cos.size(-1);
-  at::Tensor proj = at::linear(x, l.qkv_proj);
+  at::Tensor proj = at::linear(x, l.qkv_proj.dense());
   at::Tensor qg = proj.narrow(1, 0, H * hd * 2).view({L, H, 2 * hd});
   at::Tensor q = qg.narrow(2, 0, hd), gate = qg.narrow(2, hd, hd);
   at::Tensor k = proj.narrow(1, H * hd * 2, Hkv * hd).view({L, Hkv, hd});
@@ -209,7 +209,7 @@ at::Tensor WeMMModel::full_attention_reference(const TextLayer& l, const at::Ten
     o = attention(q, k, v, pk.cu_seqlens, pk.cu_seqlens, pk.max_len, pk.max_len, /*causal=*/true);
   }
   o = (o.to(at::kFloat) * at::sigmoid(gate.to(at::kFloat))).to(act_);
-  return at::linear(o.reshape({o.size(0), H * hd}), l.o_proj);
+  return at::linear(o.reshape({o.size(0), H * hd}), l.o_proj.dense());
 }
 
 }  // namespace wemm

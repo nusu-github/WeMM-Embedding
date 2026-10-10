@@ -19,7 +19,7 @@ double time_ms(F f, int iters = 20) {
 
 int main() {
   c10::InferenceMode guard;
-  auto o = at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
+  auto o = at::TensorOptions().device(at::kCUDA).dtype(at::kHalf);
   struct S { int64_t M, N, K; bool bias, gelu, resid32; const char* name; };
   S shapes[] = {
       {10560, 3072, 1024, true, false, false, "vit qkv+bias"},
@@ -31,6 +31,12 @@ int main() {
       {2743, 12288, 2048, false, false, false, "lm gate_up"},
       {2743, 2048, 6144, false, false, true, "lm down+res32"},
       {13, 12288, 2048, false, false, false, "lm gate_up M=13"},
+      {13, 8224, 2048, false, false, false, "lm in_proj M=13"},
+      {13, 2048, 2048, false, false, true, "lm out_proj M=13"},
+      {13, 2048, 6144, false, false, true, "lm down M=13"},
+      {64, 12288, 2048, false, false, false, "lm gate_up M=64"},
+      {64, 2048, 6144, false, false, true, "lm down M=64"},
+      {200, 12288, 2048, false, false, false, "lm gate_up M=200"},
   };
   for (auto& s : shapes) {
     at::Tensor x = at::randn({s.M, s.K}, o), w = at::randn({s.N, s.K}, o) * 0.02;
@@ -49,5 +55,6 @@ int main() {
     std::printf("%-22s M=%6lld N=%6lld K=%5lld  lt=%.3f ms  aten=%.3f ms  plain_mm=%.3f ms (%.1f TFLOPS)\n", s.name,
                 (long long)s.M, (long long)s.N, (long long)s.K, t_lt, t_aten, t_plain,
                 2.0 * s.M * s.N * s.K / t_plain / 1e9);
+    std::printf("%22s weight stream: lt %.0f GB/s\n", "", 2.0 * s.N * s.K / t_lt / 1e6);
   }
 }

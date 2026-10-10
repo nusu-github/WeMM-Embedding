@@ -1,5 +1,7 @@
 #include "wemm/pixels.h"
 
+#include "model_internal.h"
+
 #include "wemm/common.h"
 
 namespace wemm {
@@ -17,9 +19,8 @@ at::Tensor make_pixel_values(const Visual& v, const ProcessorConfig& cfg, const 
     mean[c] = float(double(cfg.image_mean[c]) * (1.0 / cfg.rescale_factor));
     std_[c] = float(double(cfg.image_std[c]) * (1.0 / cfg.rescale_factor));
   }
-  at::Tensor mean_t = at::tensor(at::ArrayRef<float>(mean, 3)).to(device);
-  at::Tensor std_t = at::tensor(at::ArrayRef<float>(std_, 3)).to(device);
-  x = (x - mean_t) / std_t;
+  const auto ms = detail::Upload().add(mean, 3).add(std_, 3).to(device);
+  x = (x - ms[0]) / ms[1];
 
   if (int64_t pad = (tp - T % tp) % tp) x = at::cat({x, x.slice(0, T - 1, T).expand({pad, H, W, C})}, 0);
   const int64_t gt = x.size(0) / tp, gh = H / p, gw = W / p;

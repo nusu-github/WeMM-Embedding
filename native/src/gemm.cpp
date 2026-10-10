@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <vector>
 #include <optional>
 #include <tuple>
 
@@ -23,7 +24,7 @@ namespace {
   } while (0)
 
 constexpr size_t kWorkspace = 32u << 20;
-constexpr int kMaxAlgos = 8;
+constexpr int kMaxAlgos = 16;
 
 // Our own cuBLASLt handle per device: LibTorch distributions bundle a
 // privately named cuBLASLt, so a handle obtained from ATen must not be mixed
@@ -72,10 +73,6 @@ struct Layout {
     LT_CHECK(cublasLtMatrixLayoutCreate(&l, t, rows, cols, ld));
   }
   ~Layout() { cublasLtMatrixLayoutDestroy(l); }
-  void batch(int32_t count, int64_t stride) {
-    LT_CHECK(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &count, sizeof(count)));
-    LT_CHECK(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride, sizeof(stride)));
-  }
 };
 struct Pref {
   cublasLtMatmulPreference_t p = nullptr;
@@ -166,20 +163,40 @@ cublasLtMatmulAlgo_t tune_algo(const AlgoKey& key, const Problem& p, void* ws, c
   WEMM_CHECK(n > 0, "gemm: no cuBLASLt algorithm for this problem");
   cublasLtMatmulAlgo_t best = res[0].algo;
   if (n > 1) {
-    Events ev;
-    float best_ms = 1e30f;
+    // Candidates: the heuristic's top picks plus split-K variants of them,
+    // which fill the GPU when few output tiles exist (short inputs).
+    std::vector<cublasLtMatmulAlgo_t> cands;
     for (int i = 0; i < n; ++i) {
       if (res[i].state != CUBLAS_STATUS_SUCCESS || res[i].workspaceSize > kWorkspace) continue;
-      if (run(p, &res[i].algo, ws, stream) != CUBLAS_STATUS_SUCCESS) continue;  // warm-up
+      cands.push_back(res[i].algo);
+      if (std::get<1>(key) > 256) continue;
+      for (int32_t splits : {2, 3, 4, 6, 8}) {
+        cublasLtMatmulAlgo_t a = res[i].algo;
+        const uint32_t scheme = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+        if (cublasLtMatmulAlgoConfigSetAttribute(&a, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splits, sizeof(splits)) !=
+                CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatmulAlgoConfigSetAttribute(&a, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &scheme,
+                                                 sizeof(scheme)) != CUBLAS_STATUS_SUCCESS)
+          continue;
+        cublasLtMatmulHeuristicResult_t chk{};
+        if (cublasLtMatmulAlgoCheck(lt_handle(), p.op, p.a, p.b, p.c, p.c, &a, &chk) == CUBLAS_STATUS_SUCCESS &&
+            chk.workspaceSize <= kWorkspace)
+          cands.push_back(a);
+      }
+    }
+    Events ev;
+    float best_ms = 1e30f;
+    for (const auto& a : cands) {
+      if (run(p, &a, ws, stream) != CUBLAS_STATUS_SUCCESS) continue;  // warm-up
       C10_CUDA_CHECK(cudaEventRecord(ev.a, stream));
-      for (int r = 0; r < 3; ++r) run(p, &res[i].algo, ws, stream);
+      for (int r = 0; r < 5; ++r) run(p, &a, ws, stream);
       C10_CUDA_CHECK(cudaEventRecord(ev.b, stream));
       C10_CUDA_CHECK(cudaEventSynchronize(ev.b));
       float ms = 0;
       C10_CUDA_CHECK(cudaEventElapsedTime(&ms, ev.a, ev.b));
       if (ms < best_ms) {
         best_ms = ms;
-        best = res[i].algo;
+        best = a;
       }
     }
   }
@@ -275,30 +292,15 @@ void gemm_accumulate(const at::Tensor& x, const at::Tensor& w, const std::option
   gemm_impl(x, w, bias, &acc, acc, Epilogue::None);
 }
 
-void gemm_f32_batched(const at::Tensor& a, const at::Tensor& b, at::Tensor& out, bool accumulate) {
-  WEMM_CHECK(a.dim() == 3 && b.dim() == 3 && out.dim() == 3, "gemm_f32_batched: expects 3-D tensors");
-  WEMM_CHECK(a.is_contiguous() && b.is_contiguous() && out.is_contiguous(), "gemm_f32_batched: contiguous only");
-  WEMM_CHECK(a.scalar_type() == at::kFloat && b.scalar_type() == at::kFloat && out.scalar_type() == at::kFloat,
-             "gemm_f32_batched: fp32 only");
-  const int64_t B = a.size(0), M = a.size(1), K = a.size(2), N = b.size(2);
-  WEMM_CHECK(b.size(0) == B && b.size(1) == K && out.size(0) == B && out.size(1) == M && out.size(2) == N,
-             "gemm_f32_batched: shape mismatch");
-  WEMM_CHECK(B <= INT32_MAX, "gemm_f32_batched: batch too large");
-  if (B == 0) return;
-  c10::cuda::CUDAGuard guard(a.device());
-  // Column-major: out^T[N,M] = b^T[N,K] * a^T[K,M]; both operands untransposed.
-  OpDesc op(CUBLAS_COMPUTE_32F_PEDANTIC, CUDA_R_32F);
-  Layout la(CUDA_R_32F, N, K, N), lb(CUDA_R_32F, K, M, K), lc(CUDA_R_32F, N, M, N);
-  la.batch(int32_t(B), K * N);
-  lb.batch(int32_t(B), M * K);
-  lc.batch(int32_t(B), M * N);
-  Problem p{op.d, la.l, lb.l, lc.l, b.data_ptr(), a.data_ptr(), out.data_ptr(), out.data_ptr(), accumulate ? 1.f : 0.f};
-  auto stream = at::cuda::getCurrentCUDAStream();
-  at::Tensor ws = at::empty({int64_t(kWorkspace)}, a.options().dtype(at::kByte));
-  const AlgoKey key{a.get_device(), m_bucket(B), M, N, K, 0, -1, int(accumulate), int(CUDA_R_32F), int(CUDA_R_32F), 1};
-  // The heuristic's pick is fine for these small batched tiles (no autotune).
-  const cublasLtMatmulAlgo_t algo = algo_for(key, p, out, ws.data_ptr(), stream, /*autotune=*/false);
-  LT_CHECK(run(p, &algo, ws.data_ptr(), stream));
+at::Tensor gemm(const at::Tensor& x, const Weight& w, const std::optional<at::Tensor>& bias,
+                const std::optional<at::Tensor>& residual, Epilogue epilogue,
+                std::optional<at::ScalarType> out_dtype) {
+  return gemm(x, w.dense(), bias, residual, epilogue, out_dtype);
+}
+
+void gemm_accumulate(const at::Tensor& x, const Weight& w, const std::optional<at::Tensor>& bias,
+                     at::Tensor& acc) {
+  gemm_accumulate(x, w.dense(), bias, acc);
 }
 
 }  // namespace wemm

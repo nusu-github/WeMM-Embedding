@@ -5,6 +5,7 @@
 
 #include <ATen/ATen.h>
 
+#include <array>
 #include <utility>
 
 namespace wemm::kernels {
@@ -87,6 +88,22 @@ GdnRecurrence gdn_chunk_recurrence(const GdnChunks& ch, const at::Tensor& chunk_
 void gdn_chunk_output(const GdnChunks& ch, const GdnRecurrence& rec, const at::Tensor& chunk_start,
                       const at::Tensor& chunk_valid, const at::Tensor& seq_start, int64_t chunk_begin,
                       const at::Tensor& z, const at::Tensor& w, double eps, at::Tensor& out);
+
+// ------------------------------------------------------ weight compression
+// Exponent histogram of a bf16 CUDA tensor (synchronizes).
+std::array<int64_t, 256> weight_exponent_histogram(const at::Tensor& x);
+
+// Compressed form of a bf16 CUDA tensor (numel % 64 == 0), see wemm/weight.h:
+// exponents in [base+1, base+7] become codes 1..7, the rest are outliers.
+struct CompressedWeight {
+  at::Tensor planes, sm, exps, offs;
+};
+CompressedWeight compress_weight(const at::Tensor& x, int base);
+
+// Decodes a compressed bf16 weight (wemm/weight.h) into out (bf16 or fp16,
+// contiguous, numel = sm.numel()).
+void decompress_weight(const at::Tensor& planes, const at::Tensor& sm, const at::Tensor& exps,
+                       const at::Tensor& offs, int base, at::Tensor& out);
 
 // Bytes of fp32 workspace one (head, chunk) pair needs in the GDN path; used
 // to size chunk windows.

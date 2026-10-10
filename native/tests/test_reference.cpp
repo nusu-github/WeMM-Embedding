@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
     if (std::string(argv[i]) == "--bf16") opts.model.compute_dtype = at::kBFloat16;
     if (std::string(argv[i]) == "--mem-efficient") opts.model.attention = AttentionBackend::MemEfficient;
     if (std::string(argv[i]) == "--emb-gpu") opts.model.embeddings_on_gpu = true;
+    if (std::string(argv[i]) == "--compress") opts.model.compress_weights = true;
     if (std::string(argv[i]) == "--gdn-window" && i + 1 < argc) opts.model.gdn_window_bytes = std::stoll(argv[++i]);
     if (std::string(argv[i]) == "--only" && i + 1 < argc) only = "," + std::string(argv[++i]) + ",";
   }

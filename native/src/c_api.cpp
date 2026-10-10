@@ -45,6 +45,7 @@ wemm_embedder* wemm_create(const char* model_dir, int device, const char* option
       opts.intra_op_threads = j.value("intra_op_threads", opts.intra_op_threads);
       opts.model.fp32_residual = j.value("fp32_residual", opts.model.fp32_residual);
       opts.model.embeddings_on_gpu = j.value("embeddings_on_gpu", opts.model.embeddings_on_gpu);
+      opts.model.compress_weights = j.value("compress_weights", opts.model.compress_weights);
       opts.model.gdn_window_bytes = j.value("gdn_window_bytes", opts.model.gdn_window_bytes);
       opts.model.mlp_chunk_tokens = j.value("mlp_chunk_tokens", opts.model.mlp_chunk_tokens);
       if (j.contains("compute_dtype")) {

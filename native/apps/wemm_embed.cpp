@@ -54,6 +54,7 @@ int main(int argc, char** argv) {
       else if (a == "--threads") opts.preprocess_threads = std::stoi(next());
       else if (a == "--repeat") repeat = std::max(1, std::stoi(next()));  // timing: report the last run
       else if (a == "--device") opts.model.device_index = std::stoi(next());
+      else if (a == "--compress-weights") opts.model.compress_weights = true;
       else if (a == "--text") inputs.push_back(text_conversation(next()));
       else if (a == "--image") inputs.push_back(image_conversation(next()));
       else if (a == "--video") inputs.push_back(video_conversation(next()));

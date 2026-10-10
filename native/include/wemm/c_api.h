@@ -22,7 +22,7 @@ typedef struct wemm_embedder wemm_embedder;
 
 /* device: CUDA device index (-1 = 0). options_json may be NULL or e.g.
  * {"max_batch_tokens": 32768, "preprocess_threads": 8, "compute_dtype": "fp16",
- *  "fp32_residual": true, "embeddings_on_gpu": false}.
+ *  "fp32_residual": true, "embeddings_on_gpu": false, "compress_weights": false}.
  * Returns NULL on failure (see wemm_last_error). */
 wemm_embedder* wemm_create(const char* model_dir, int device, const char* options_json);
 void wemm_destroy(wemm_embedder* e);

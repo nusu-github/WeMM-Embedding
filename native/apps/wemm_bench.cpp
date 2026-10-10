@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
     else if (a == "--bf16") opts.model.compute_dtype = at::kBFloat16;
     else if (a == "--mem-efficient") opts.model.attention = AttentionBackend::MemEfficient;
     else if (a == "--emb-gpu") opts.model.embeddings_on_gpu = true;
+    else if (a == "--compress") opts.model.compress_weights = true;
     else if (a == "--gdn-window") opts.model.gdn_window_bytes = std::stoll(argv[++i]);
     else if (a == "--mlp-chunk") opts.model.mlp_chunk_tokens = std::stoll(argv[++i]);
     else if (a == "--batch-tokens") opts.max_batch_tokens = std::stoll(argv[++i]);

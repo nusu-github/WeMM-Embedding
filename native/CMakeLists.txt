@@ -52,10 +52,12 @@ add_library(wemm SHARED
   src/model_fused.cpp
   src/model_reference.cpp
   src/gemm.cpp
+  src/weight.cpp
   src/embedder.cpp
   src/c_api.cpp
   src/kernels/gdn.cu
   src/kernels/fused.cu
+  src/kernels/weight.cu
 )
 target_include_directories(wemm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(wemm
@@ -80,6 +82,9 @@ target_link_libraries(wemm_bench_gemm PRIVATE wemm)
 
 add_executable(wemm_bench_gdn tests/bench_gdn.cpp)
 target_link_libraries(wemm_bench_gdn PRIVATE wemm)
+
+add_executable(wemm_test_weight tests/test_weight.cpp)
+target_link_libraries(wemm_test_weight PRIVATE wemm)
 
 add_executable(wemm_test_c_api tests/test_c_api.c)
 target_link_libraries(wemm_test_c_api PRIVATE wemm m)

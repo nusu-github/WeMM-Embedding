@@ -9,6 +9,7 @@
 
 #include "wemm/config.h"
 #include "wemm/processor.h"
+#include "wemm/weight.h"
 
 namespace wemm {
 
@@ -47,6 +48,11 @@ struct ModelOptions {
   // unless PYTORCH_CUDA_ALLOC_CONF is set. Process-wide; applied before the
   // first CUDA allocation only.
   bool expandable_segments = true;
+  // Store the GEMM weight matrices with lossless compression (~27% less
+  // weight memory, bit-identical results). Each matrix is decompressed into
+  // a temporary right before its GEMM: a few percent slower on long inputs,
+  // noticeably slower on very short ones.
+  bool compress_weights = false;
 };
 
 // Native Qwen3.5 (Gated DeltaNet / gated attention) + ViT embedding model.
@@ -72,26 +78,26 @@ class WeMMModel {
  private:
   struct VisionBlock {
     at::Tensor norm1_w, norm1_b, norm2_w, norm2_b;  // fp32
-    at::Tensor qkv_w, qkv_b, fc1_w, fc1_b;          // act
-    at::Tensor proj_w, fc2_w;                       // act
+    Weight qkv_w, proj_w, fc1_w, fc2_w;
+    at::Tensor qkv_b, fc1_b;                        // act
     at::Tensor proj_b, fc2_b;                       // residual dtype (fp32 or act)
   };
   struct TextLayer {
     bool linear = true;
     at::Tensor in_norm, post_norm;  // fp32 (1 + w)
     // linear attention
-    at::Tensor in_proj;             // [qkv | z | b | a | pad] x hidden, act
+    Weight in_proj;                 // [qkv | z | b | a | pad] x hidden
     at::Tensor conv_w;              // [conv_dim, K] fp32
     at::Tensor neg_A;               // -exp(A_log) fp32 [Hv]
     at::Tensor dt_bias;             // fp32 [Hv]
     at::Tensor gnorm_w;             // fp32 [dv]
-    at::Tensor out_proj;
+    Weight out_proj;
     // full attention
-    at::Tensor qkv_proj;            // [q(+gate) | k | v] x hidden, act
+    Weight qkv_proj;                // [q(+gate) | k | v] x hidden
     at::Tensor q_norm, k_norm;      // fp32 (1 + w)
-    at::Tensor o_proj;
+    Weight o_proj;
     // mlp
-    at::Tensor gate_up, down;
+    Weight gate_up, down;
   };
 
   // Per-batch inputs shared by all text layers (both implementations).
@@ -150,9 +156,11 @@ class WeMMModel {
   AttentionBackend attn_ = AttentionBackend::Flash;
 
   // vision
-  at::Tensor patch_w, patch_b /* fp32 */, pos_embed;
+  Weight patch_w;
+  at::Tensor patch_b /* fp32 */, pos_embed;
   std::vector<VisionBlock> vblocks_;
-  at::Tensor merger_norm_w, merger_norm_b /* fp32 */, merger_fc1_w, merger_fc1_b, merger_fc2_w, merger_fc2_b;
+  at::Tensor merger_norm_w, merger_norm_b /* fp32 */, merger_fc1_b, merger_fc2_b;
+  Weight merger_fc1_w, merger_fc2_w;
   at::Tensor vision_inv_freq;  // fp32 [head_dim/4]
   // text
   at::Tensor embed_tokens;  // [V, D]: device (act) or memory-mapped host (bf16)
