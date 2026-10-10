@@ -95,6 +95,20 @@ python -m sglang.launch_server \
 
 Equivalent one-command wrappers are available in `scripts/serve_vllm.sh` and `scripts/serve_sglang.sh`.
 
+## Native Inference (C++ / LibTorch, no Python)
+
+[`native/`](native/README.md) is a Python-free C++ runtime for the same checkpoints: the model runs on
+LibTorch with custom CUDA kernels (CUDA 13.0), tokenization uses the Hugging Face `tokenizers` Rust core,
+and media goes through OpenCV / FFmpeg. Preprocessing is bit-exact with the Transformers pipeline above,
+embeddings are closer to the fp32 model than the Transformers bf16 run, and it is 1.1–6.5× faster per
+forward pass (about 3× end to end). See [native/README.md](native/README.md) (Japanese) for build
+instructions, usage and measurements.
+
+```bash
+cmake -S native -B build -G Ninja -DCMAKE_PREFIX_PATH=/path/to/libtorch && cmake --build build
+./build/wemm_embed --model /path/to/WeMM-Embedding-2B --text "A dog is running on a beach." --image cat.jpg
+```
+
 ## Matryoshka Embeddings
 
 For a supported dimension `d`, truncate the full embedding and normalize it again:

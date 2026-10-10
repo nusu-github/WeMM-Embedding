@@ -81,3 +81,6 @@ target_link_libraries(wemm_bench_gdn PRIVATE wemm)
 
 add_executable(wemm_test_c_api tests/test_c_api.c)
 target_link_libraries(wemm_test_c_api PRIVATE wemm m)
+
+add_executable(wemm_example apps/example.cpp)
+target_link_libraries(wemm_example PRIVATE wemm)
