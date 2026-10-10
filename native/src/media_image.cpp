@@ -1,5 +1,6 @@
 #include <ATen/Parallel.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -19,7 +20,17 @@ at::Tensor decode_image(const uint8_t* data, size_t size) {
   cv::Mat img = cv::imdecode(buf, cv::IMREAD_UNCHANGED);
   WEMM_CHECK(!img.empty(), "failed to decode image");
   if (img.depth() == CV_16U) {
-    img.convertTo(img, CV_8U, 1.0 / 256.0);  // keep the high byte
+    // Pillow: 16-bit RGB(A) keeps the high byte; 16-bit grayscale ("I;16")
+    // converts to RGB by clipping to 255.
+    cv::Mat out(img.rows, img.cols, CV_MAKETYPE(CV_8U, img.channels()));
+    const bool gray = img.channels() == 1;
+    for (int r = 0; r < img.rows; ++r) {
+      const uint16_t* s = img.ptr<uint16_t>(r);
+      uint8_t* d = out.ptr<uint8_t>(r);
+      for (int i = 0; i < img.cols * img.channels(); ++i)
+        d[i] = gray ? uint8_t(std::min<uint16_t>(s[i], 255)) : uint8_t(s[i] >> 8);
+    }
+    img = out;
   }
   WEMM_CHECK(img.depth() == CV_8U, "unsupported image bit depth");
 
@@ -53,17 +64,24 @@ at::Tensor decode_image(const uint8_t* data, size_t size) {
     default:
       throw Error("unsupported channel count " + std::to_string(img.channels()));
   }
+  WEMM_CHECK(rgb.isContinuous(), "unexpected non-continuous image");
   auto t = at::empty({rgb.rows, rgb.cols, 3}, at::kByte);
-  for (int r = 0; r < rgb.rows; ++r)
-    std::memcpy(t.data_ptr<uint8_t>() + int64_t(r) * rgb.cols * 3, rgb.ptr<uint8_t>(r), size_t(rgb.cols) * 3);
+  std::memcpy(t.data_ptr<uint8_t>(), rgb.ptr<uint8_t>(0), size_t(rgb.total()) * 3);
   return t;
 }
 
+std::string strip_file_scheme(const std::string& path) {
+  return path.rfind("file://", 0) == 0 ? path.substr(7) : path;
+}
+
 at::Tensor load_image(const std::string& path) {
-  std::string p = path.rfind("file://", 0) == 0 ? path.substr(7) : path;
-  std::ifstream in(p, std::ios::binary);
+  const std::string p = strip_file_scheme(path);
+  std::ifstream in(p, std::ios::binary | std::ios::ate);
   WEMM_CHECK(in.good(), "cannot open image ", p);
-  std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::vector<uint8_t> bytes(size_t(in.tellg()));
+  in.seekg(0);
+  in.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+  WEMM_CHECK(in.good() && !bytes.empty(), "cannot read image ", p);
   return decode_image(bytes.data(), bytes.size());
 }
 

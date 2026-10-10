@@ -1,22 +1,35 @@
 //! Minimal C ABI over the Hugging Face `tokenizers` crate.
+//!
+//! Every entry point checks its pointers and catches panics, so no unwinding
+//! crosses the FFI boundary; failures return null / -1 and an error string
+//! that the caller frees with `wemm_tok_free_str`.
 
 use std::ffi::{c_char, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use tokenizers::Tokenizer;
 
 fn set_err(err: *mut *mut c_char, msg: String) {
     if !err.is_null() {
-        unsafe { *err = CString::new(msg).unwrap_or_default().into_raw() };
+        unsafe { *err = CString::new(msg.replace('\0', " ")).unwrap_or_default().into_raw() };
     }
 }
 
 #[no_mangle]
 pub extern "C" fn wemm_tok_from_file(path: *const c_char, err: *mut *mut c_char) -> *mut Tokenizer {
+    if path.is_null() {
+        set_err(err, "null path".into());
+        return ptr::null_mut();
+    }
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy().into_owned();
-    match Tokenizer::from_file(&path) {
-        Ok(t) => Box::into_raw(Box::new(t)),
-        Err(e) => {
+    match catch_unwind(|| Tokenizer::from_file(&path)) {
+        Ok(Ok(t)) => Box::into_raw(Box::new(t)),
+        Ok(Err(e)) => {
             set_err(err, format!("failed to load tokenizer {path}: {e}"));
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_err(err, format!("panic while loading tokenizer {path}"));
             ptr::null_mut()
         }
     }
@@ -49,10 +62,20 @@ pub extern "C" fn wemm_tok_encode_batch(
     out_lens: *mut usize,
     err: *mut *mut c_char,
 ) -> i32 {
+    if tok.is_null() || (n > 0 && (texts.is_null() || text_lens.is_null() || out_ids.is_null() || out_lens.is_null())) {
+        set_err(err, "null argument".into());
+        return -1;
+    }
     let tok = unsafe { &*tok };
     let mut inputs = Vec::with_capacity(n);
     for i in 0..n {
-        let bytes = unsafe { std::slice::from_raw_parts(*texts.add(i) as *const u8, *text_lens.add(i)) };
+        let p = unsafe { *texts.add(i) };
+        let len = unsafe { *text_lens.add(i) };
+        if p.is_null() && len > 0 {
+            set_err(err, format!("input {i} is null"));
+            return -1;
+        }
+        let bytes = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(p as *const u8, len) } };
         match std::str::from_utf8(bytes) {
             Ok(s) => inputs.push(s.to_owned()),
             Err(e) => {
@@ -61,10 +84,14 @@ pub extern "C" fn wemm_tok_encode_batch(
             }
         }
     }
-    let encodings = match tok.encode_batch(inputs, add_special_tokens) {
-        Ok(e) => e,
-        Err(e) => {
+    let encodings = match catch_unwind(AssertUnwindSafe(|| tok.encode_batch(inputs, add_special_tokens))) {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => {
             set_err(err, format!("encode failed: {e}"));
+            return -1;
+        }
+        Err(_) => {
+            set_err(err, "panic during encoding".into());
             return -1;
         }
     };
@@ -83,12 +110,4 @@ pub extern "C" fn wemm_tok_free_ids(ids: *mut u32, len: usize) {
     if !ids.is_null() {
         unsafe { drop(Box::from_raw(ptr::slice_from_raw_parts_mut(ids, len))) };
     }
-}
-
-/// Returns -1 when the token is unknown.
-#[no_mangle]
-pub extern "C" fn wemm_tok_token_to_id(tok: *const Tokenizer, token: *const c_char) -> i64 {
-    let tok = unsafe { &*tok };
-    let token = unsafe { CStr::from_ptr(token) }.to_string_lossy();
-    tok.token_to_id(&token).map(|v| v as i64).unwrap_or(-1)
 }

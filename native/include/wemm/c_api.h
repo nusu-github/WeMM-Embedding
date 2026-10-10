@@ -21,12 +21,13 @@ extern "C" {
 typedef struct wemm_embedder wemm_embedder;
 
 /* device: CUDA device index (-1 = 0). options_json may be NULL or e.g.
- * {"max_batch_tokens": 32768, "preprocess_threads": 8, "fp32_residual": true}.
+ * {"max_batch_tokens": 32768, "preprocess_threads": 8, "compute_dtype": "fp16",
+ *  "fp32_residual": true, "embeddings_on_gpu": false}.
  * Returns NULL on failure (see wemm_last_error). */
 wemm_embedder* wemm_create(const char* model_dir, int device, const char* options_json);
 void wemm_destroy(wemm_embedder* e);
 
-/* Embedding width for a Matryoshka dimension (0 = full). */
+/* Embedding width for a Matryoshka dimension (0 = full); 0 if invalid. */
 int wemm_dim(const wemm_embedder* e, int dimension);
 
 /* Embeds n inputs into out (n * wemm_dim(e, dimension) floats, row-major,

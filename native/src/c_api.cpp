@@ -36,7 +36,7 @@ wemm_embedder* wemm_create(const char* model_dir, int device, const char* option
   wemm_embedder* out = nullptr;
   guarded([&] {
     wemm::EmbedderOptions opts;
-    opts.model.device_index = device < 0 ? 0 : device;
+    opts.model.device_index = device < 0 ? 0 : device;  // validated by the model
     if (options_json && *options_json) {
       auto j = nlohmann::json::parse(options_json);
       opts.max_batch_tokens = j.value("max_batch_tokens", opts.max_batch_tokens);
@@ -44,6 +44,14 @@ wemm_embedder* wemm_create(const char* model_dir, int device, const char* option
       opts.preprocess_threads = j.value("preprocess_threads", opts.preprocess_threads);
       opts.intra_op_threads = j.value("intra_op_threads", opts.intra_op_threads);
       opts.model.fp32_residual = j.value("fp32_residual", opts.model.fp32_residual);
+      opts.model.embeddings_on_gpu = j.value("embeddings_on_gpu", opts.model.embeddings_on_gpu);
+      opts.model.gdn_window_bytes = j.value("gdn_window_bytes", opts.model.gdn_window_bytes);
+      opts.model.mlp_chunk_tokens = j.value("mlp_chunk_tokens", opts.model.mlp_chunk_tokens);
+      if (j.contains("compute_dtype")) {
+        const std::string dt = j.at("compute_dtype").get<std::string>();
+        WEMM_CHECK(dt == "fp16" || dt == "bf16", "compute_dtype must be \"fp16\" or \"bf16\"");
+        opts.model.compute_dtype = dt == "fp16" ? at::kHalf : at::kBFloat16;
+      }
     }
     auto e = std::make_unique<wemm_embedder>();
     e->impl = std::make_unique<wemm::Embedder>(model_dir, opts);
@@ -56,7 +64,9 @@ void wemm_destroy(wemm_embedder* e) { delete e; }
 
 int wemm_dim(const wemm_embedder* e, int dimension) {
   if (!e) return 0;
-  return dimension > 0 ? dimension : e->impl->model().config().text.hidden_size;
+  const int hidden = e->impl->model().config().text.hidden_size;
+  if (dimension <= 0) return hidden;
+  return dimension <= hidden ? dimension : 0;  // 0: invalid dimension
 }
 
 int wemm_embed_json(wemm_embedder* e, const char* const* inputs_json, size_t n, int dimension, float* out) {

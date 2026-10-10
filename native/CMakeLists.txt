@@ -7,11 +7,11 @@ set(CMAKE_CUDA_STANDARD 17)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-# Kernels use bf16 math and cp.async: Ampere (sm_80) or newer. LibTorch's CMake
-# drives -gencode from TORCH_CUDA_ARCH_LIST, so set that (override with
+# Turing (sm_75, fp16 path) through Blackwell. LibTorch's CMake drives
+# -gencode from TORCH_CUDA_ARCH_LIST, so set that (override with
 # -DTORCH_CUDA_ARCH_LIST="8.6" to build for one GPU only).
 if(NOT DEFINED TORCH_CUDA_ARCH_LIST)
-  set(TORCH_CUDA_ARCH_LIST "8.0;8.6;8.9;9.0;10.0;12.0+PTX")
+  set(TORCH_CUDA_ARCH_LIST "7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX")
 endif()
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
 
@@ -49,6 +49,8 @@ add_library(wemm SHARED
   src/processor.cpp
   src/pixels.cpp
   src/model.cpp
+  src/model_fused.cpp
+  src/model_reference.cpp
   src/gemm.cpp
   src/embedder.cpp
   src/c_api.cpp

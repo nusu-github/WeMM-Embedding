@@ -1,13 +1,13 @@
 #include "wemm/gemm.h"
 
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cublasLt.h>
 
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <tuple>
-#include <unordered_map>
 
 #include "wemm/common.h"
 
@@ -15,64 +15,31 @@ namespace wemm {
 
 namespace {
 
-#define LT_CHECK(expr)                                                                   \
-  do {                                                                                   \
-    cublasStatus_t st_ = (expr);                                                         \
-    WEMM_CHECK(st_ == CUBLAS_STATUS_SUCCESS, #expr " failed with status ", int(st_));   \
+#define LT_CHECK(expr)                                                                 \
+  do {                                                                                 \
+    cublasStatus_t st_ = (expr);                                                       \
+    WEMM_CHECK(st_ == CUBLAS_STATUS_SUCCESS, #expr " failed with status ", int(st_)); \
   } while (0)
 
 constexpr size_t kWorkspace = 32u << 20;
+constexpr int kMaxAlgos = 8;
 
-struct Key {
-  int64_t m, n, k, lda, ldb;
-  int epi;
-  bool beta, f32;
-  int device;
-  bool operator==(const Key& o) const {
-    return std::tie(m, n, k, lda, ldb, epi, beta, f32, device) ==
-           std::tie(o.m, o.n, o.k, o.lda, o.ldb, o.epi, o.beta, o.f32, o.device);
-  }
-};
-struct KeyHash {
-  size_t operator()(const Key& k) const {
-    size_t h = std::hash<int64_t>()(k.m);
-    for (int64_t v : {k.n, k.k, k.lda, k.ldb, int64_t(k.epi), int64_t(k.beta), int64_t(k.f32), int64_t(k.device)})
-      h = h * 1000003u ^ std::hash<int64_t>()(v);
-    return h;
-  }
-};
-
-struct Plan {
-  cublasLtMatmulDesc_t op = nullptr;
-  cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
-  cublasLtMatmulAlgo_t algo{};
-};
-
-std::mutex g_mu;
-
-// Our own cuBLASLt handle: LibTorch distributions may bundle a privately named
-// cuBLASLt, so a handle obtained from ATen must not be mixed with the library
-// this file links against.
+// Our own cuBLASLt handle per device: LibTorch distributions bundle a
+// privately named cuBLASLt, so a handle obtained from ATen must not be mixed
+// with the library this file links against.
 cublasLtHandle_t lt_handle() {
-  static cublasLtHandle_t h = [] {
-    cublasLtHandle_t x;
-    LT_CHECK(cublasLtCreate(&x));
-    return x;
-  }();
-  return h;
-}
-std::unordered_map<Key, Plan, KeyHash> g_plans;
-// Autotuned algorithms, keyed by the plan key with M rounded to a bucket so
-// that varying token counts reuse one tuning result.
-std::unordered_map<Key, cublasLtMatmulAlgo_t, KeyHash> g_tuned;
-
-int64_t m_bucket(int64_t m) {
-  if (m <= 256) {
-    int64_t b = 1;
-    while (b < m) b <<= 1;
-    return b;
+  static std::mutex mu;
+  static std::map<int, cublasLtHandle_t> handles;
+  int dev = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&dev));
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = handles.find(dev);
+  if (it == handles.end()) {
+    cublasLtHandle_t h;
+    LT_CHECK(cublasLtCreate(&h));
+    it = handles.emplace(dev, h).first;
   }
-  return (m + 511) / 512 * 512;
+  return it->second;
 }
 
 bool autotune_enabled() {
@@ -83,140 +50,210 @@ bool autotune_enabled() {
   return on;
 }
 
+// ---- RAII wrappers for the per-call descriptors
+struct OpDesc {
+  cublasLtMatmulDesc_t d = nullptr;
+  OpDesc(cublasComputeType_t ct, cudaDataType_t st) { LT_CHECK(cublasLtMatmulDescCreate(&d, ct, st)); }
+  ~OpDesc() { cublasLtMatmulDescDestroy(d); }
+  template <typename V>
+  void set(cublasLtMatmulDescAttributes_t a, const V& v) {
+    LT_CHECK(cublasLtMatmulDescSetAttribute(d, a, &v, sizeof(v)));
+  }
+};
+struct Layout {
+  cublasLtMatrixLayout_t l = nullptr;
+  Layout(cudaDataType_t t, uint64_t rows, uint64_t cols, int64_t ld) {
+    LT_CHECK(cublasLtMatrixLayoutCreate(&l, t, rows, cols, ld));
+  }
+  ~Layout() { cublasLtMatrixLayoutDestroy(l); }
+  void batch(int32_t count, int64_t stride) {
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &count, sizeof(count)));
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride, sizeof(stride)));
+  }
+};
+struct Pref {
+  cublasLtMatmulPreference_t p = nullptr;
+  Pref() {
+    LT_CHECK(cublasLtMatmulPreferenceCreate(&p));
+    size_t ws = kWorkspace;
+    LT_CHECK(cublasLtMatmulPreferenceSetAttribute(p, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+  }
+  ~Pref() { cublasLtMatmulPreferenceDestroy(p); }
+};
+struct Events {
+  cudaEvent_t a = nullptr, b = nullptr;
+  Events() {
+    C10_CUDA_CHECK(cudaEventCreate(&a));
+    C10_CUDA_CHECK(cudaEventCreate(&b));
+  }
+  ~Events() {
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+  }
+};
+
+// Algorithm cache: shape with M rounded to a bucket, so varying token counts
+// share one tuning result and the cache stays bounded.
+using AlgoKey = std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, int, int, int, int, int>;
+std::mutex g_mu;
+std::map<AlgoKey, cublasLtMatmulAlgo_t> g_algos;
+
+int64_t m_bucket(int64_t m) {
+  if (m <= 256) {
+    int64_t b = 1;
+    while (b < m) b <<= 1;
+    return b;
+  }
+  return (m + 511) / 512 * 512;
+}
+
+cudaDataType_t cuda_type(at::ScalarType t) {
+  switch (t) {
+    case at::kBFloat16: return CUDA_R_16BF;
+    case at::kHalf: return CUDA_R_16F;
+    case at::kFloat: return CUDA_R_32F;
+    default: throw Error(std::string("gemm: unsupported dtype ") + c10::toString(t));
+  }
+}
+
+struct Problem {
+  cublasLtMatmulDesc_t op;
+  cublasLtMatrixLayout_t a, b, c;
+  const void *A, *B, *C;
+  void* D;
+  float beta;
+};
+
+cublasStatus_t run(const Problem& p, const cublasLtMatmulAlgo_t* algo, void* ws, cudaStream_t stream) {
+  const float alpha = 1.f;
+  return cublasLtMatmul(lt_handle(), p.op, &alpha, p.A, p.a, p.B, p.b, &p.beta, p.C, p.c, p.D, p.c, algo, ws,
+                        kWorkspace, stream);
+}
+
+// Picks (and caches) an algorithm: the heuristic's first choice, or the
+// fastest of its top candidates when autotuning. Timing runs write the real
+// output (it is recomputed by the final launch; C never aliases D).
+cublasLtMatmulAlgo_t select_algo(const AlgoKey& key, const Problem& p, void* ws, cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto it = g_algos.find(key);
+  if (it != g_algos.end()) {
+    cublasLtMatmulHeuristicResult_t chk{};
+    if (cublasLtMatmulAlgoCheck(lt_handle(), p.op, p.a, p.b, p.c, p.c, &it->second, &chk) == CUBLAS_STATUS_SUCCESS &&
+        chk.workspaceSize <= kWorkspace)
+      return it->second;
+  }
+  Pref pref;
+  cublasLtMatmulHeuristicResult_t res[kMaxAlgos]{};
+  int n = 0;
+  LT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_handle(), p.op, p.a, p.b, p.c, p.c, pref.p,
+                                          autotune_enabled() ? kMaxAlgos : 1, res, &n));
+  WEMM_CHECK(n > 0, "gemm: no cuBLASLt algorithm for this problem");
+  cublasLtMatmulAlgo_t best = res[0].algo;
+  if (n > 1) {
+    const Problem& tp = p;
+    Events ev;
+    float best_ms = 1e30f;
+    for (int i = 0; i < n; ++i) {
+      if (res[i].state != CUBLAS_STATUS_SUCCESS || res[i].workspaceSize > kWorkspace) continue;
+      if (run(tp, &res[i].algo, ws, stream) != CUBLAS_STATUS_SUCCESS) continue;  // warm-up
+      C10_CUDA_CHECK(cudaEventRecord(ev.a, stream));
+      for (int r = 0; r < 3; ++r) run(tp, &res[i].algo, ws, stream);
+      C10_CUDA_CHECK(cudaEventRecord(ev.b, stream));
+      C10_CUDA_CHECK(cudaEventSynchronize(ev.b));
+      float ms = 0;
+      C10_CUDA_CHECK(cudaEventElapsedTime(&ms, ev.a, ev.b));
+      if (ms < best_ms) {
+        best_ms = ms;
+        best = res[i].algo;
+      }
+    }
+  }
+  g_algos[key] = best;
+  return best;
+}
+
 }  // namespace
 
-at::Tensor gemm(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias,
-                const std::optional<at::Tensor>& residual, Epilogue epilogue, at::ScalarType out_dtype) {
+namespace {
+
+// D = x @ w^T (+ bias) (+ C). C may alias D (in-place accumulation).
+void gemm_impl(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias, const at::Tensor* c,
+               at::Tensor& d, Epilogue epilogue) {
   WEMM_CHECK(x.dim() == 2 && w.dim() == 2 && x.size(1) == w.size(1), "gemm: shape mismatch");
-  WEMM_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16, "gemm: bf16 only");
+  WEMM_CHECK((x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf) && w.scalar_type() == x.scalar_type(),
+             "gemm: x and w must both be bf16 or fp16");
   WEMM_CHECK(x.stride(1) == 1 && w.is_contiguous(), "gemm: x rows must be unit-stride, w contiguous");
+  WEMM_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.stride(0) * 2) % 16 == 0 &&
+                 reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
+             "gemm: operands must be 16-byte aligned");
   const int64_t M = x.size(0), K = x.size(1), N = w.size(0);
-  if (residual) out_dtype = residual->scalar_type();
-  WEMM_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kFloat, "gemm: output must be bf16 or fp32");
-  const bool f32 = out_dtype == at::kFloat;
-  at::Tensor y = at::empty({M, N}, x.options().dtype(out_dtype));
-  if (M == 0) return y;
-  if (residual) WEMM_CHECK(residual->is_contiguous() && residual->size(0) == M && residual->size(1) == N,
-                           "gemm: bad residual");
-  if (bias) WEMM_CHECK(bias->is_contiguous() && bias->numel() == N &&
-                           bias->scalar_type() == (f32 ? at::kFloat : at::kBFloat16),
-                       "gemm: bias must be contiguous and match the output dtype");
+  const at::ScalarType odt = d.scalar_type();
+  WEMM_CHECK(odt == x.scalar_type() || odt == at::kFloat, "gemm: output must be fp32 or the input dtype");
+  WEMM_CHECK(d.is_contiguous() && d.size(0) == M && d.size(1) == N, "gemm: bad output");
+  if (c)
+    WEMM_CHECK(c->is_contiguous() && c->scalar_type() == odt && c->size(0) == M && c->size(1) == N,
+               "gemm: bad residual");
+  if (bias)
+    WEMM_CHECK(bias->is_contiguous() && bias->numel() == N && bias->scalar_type() == odt,
+               "gemm: bias must be contiguous and match the output dtype");
+  if (M == 0) return;
+  c10::cuda::CUDAGuard guard(x.device());
 
   cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_DEFAULT;
   if (bias && epilogue == Epilogue::Gelu) epi = CUBLASLT_EPILOGUE_GELU_BIAS;
   else if (bias) epi = CUBLASLT_EPILOGUE_BIAS;
   else if (epilogue == Epilogue::Gelu) epi = CUBLASLT_EPILOGUE_GELU;
 
-  const int device = x.get_device();
   // Column-major view: Y^T[N,M] = W[N,K] (A, transposed) * X^T[K,M] (B).
-  Key key{M, N, K, w.stride(0), x.stride(0), int(epi), residual.has_value(), f32, device};
-  Plan* plan;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    auto it = g_plans.find(key);
-    if (it == g_plans.end()) {
-      Plan p;
-      LT_CHECK(cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-      cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
-      LT_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
-      LT_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
-      LT_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
-      if (bias) {
-        cudaDataType_t bt = f32 ? CUDA_R_32F : CUDA_R_16BF;
-        LT_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bt, sizeof(bt)));
-      }
-      LT_CHECK(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16BF, K, N, w.stride(0)));
-      LT_CHECK(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16BF, K, M, x.stride(0)));
-      LT_CHECK(cublasLtMatrixLayoutCreate(&p.c, f32 ? CUDA_R_32F : CUDA_R_16BF, N, M, N));
-      cublasLtMatmulPreference_t pref;
-      LT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
-      size_t ws = kWorkspace;
-      LT_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
-      // All pointers come from the caching allocator or are row slices of
-      // 16-byte aligned rows; require 16-byte alignment.
-      uint32_t align = 16;
-      for (auto attr : {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
-                        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES})
-        LT_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, attr, &align, sizeof(align)));
-      constexpr int kMaxAlgos = 8;
-      cublasLtMatmulHeuristicResult_t res[kMaxAlgos]{};
-      int n_res = 0;
-      LT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_handle(), p.op, p.a, p.b, p.c, p.c, pref,
-                                              autotune_enabled() ? kMaxAlgos : 1, res, &n_res));
-      cublasLtMatmulPreferenceDestroy(pref);
-      WEMM_CHECK(n_res > 0, "gemm: no cuBLASLt algorithm for M=", M, " N=", N, " K=", K);
-      p.algo = res[0].algo;
-      if (n_res > 1) {
-        Key bkey = key;
-        bkey.m = m_bucket(M);
-        auto tuned = g_tuned.find(bkey);
-        bool reused = false;
-        if (tuned != g_tuned.end()) {
-          cublasLtMatmulHeuristicResult_t chk{};
-          if (cublasLtMatmulAlgoCheck(lt_handle(), p.op, p.a, p.b, p.c, p.c,
-                                      &tuned->second, &chk) == CUBLAS_STATUS_SUCCESS &&
-              chk.workspaceSize <= kWorkspace) {
-            p.algo = tuned->second;
-            reused = true;
-          }
-        }
-        if (!reused) {
-          // Time each candidate on the real operands (outputs go to scratch).
-          auto stream = at::cuda::getCurrentCUDAStream();
-          at::Tensor scratch = at::empty({M, N}, x.options().dtype(out_dtype));
-          at::Tensor ws = at::empty({int64_t(kWorkspace)}, x.options().dtype(at::kByte));
-          if (bias) {
-            const void* bp = bias->data_ptr();
-            LT_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp)));
-          }
-          const float one = 1.f, zero = 0.f;
-          cudaEvent_t e0, e1;
-          cudaEventCreate(&e0);
-          cudaEventCreate(&e1);
-          float best = 1e30f;
-          for (int i = 0; i < n_res; ++i) {
-            if (res[i].state != CUBLAS_STATUS_SUCCESS || res[i].workspaceSize > kWorkspace) continue;
-            auto run = [&] {
-              return cublasLtMatmul(lt_handle(), p.op, &one, w.data_ptr(), p.a,
-                                    x.data_ptr(), p.b, residual ? &one : &zero,
-                                    residual ? residual->data_ptr() : scratch.data_ptr(), p.c, scratch.data_ptr(), p.c,
-                                    &res[i].algo, ws.data_ptr(), kWorkspace, stream);
-            };
-            if (run() != CUBLAS_STATUS_SUCCESS) continue;  // warm-up
-            cudaEventRecord(e0, stream);
-            for (int r = 0; r < 3; ++r) run();
-            cudaEventRecord(e1, stream);
-            cudaEventSynchronize(e1);
-            float ms = 0;
-            cudaEventElapsedTime(&ms, e0, e1);
-            if (ms < best) {
-              best = ms;
-              p.algo = res[i].algo;
-            }
-          }
-          cudaEventDestroy(e0);
-          cudaEventDestroy(e1);
-          g_tuned[bkey] = p.algo;
-        }
-      }
-      it = g_plans.emplace(key, p).first;
-    }
-    plan = &it->second;
-  }
-
+  const cudaDataType_t in_t = cuda_type(x.scalar_type()), out_t = cuda_type(odt);
+  OpDesc op(CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  op.set(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
+  op.set(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
+  op.set(CUBLASLT_MATMUL_DESC_EPILOGUE, epi);
   if (bias) {
-    const void* bp = bias->data_ptr();
-    LT_CHECK(cublasLtMatmulDescSetAttribute(plan->op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp)));
+    op.set(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, out_t);
+    op.set(CUBLASLT_MATMUL_DESC_BIAS_POINTER, bias->data_ptr());
   }
-  WEMM_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.stride(0) * 2) % 16 == 0,
-             "gemm: x must be 16-byte aligned");
-  const float alpha = 1.f, beta = residual ? 1.f : 0.f;
+  Layout la(in_t, K, N, w.stride(0)), lb(in_t, K, M, x.stride(0)), lc(out_t, N, M, N);
+  Problem p{op.d, la.l, lb.l, lc.l, w.data_ptr(), x.data_ptr(), c ? c->data_ptr() : d.data_ptr(), d.data_ptr(),
+            c ? 1.f : 0.f};
+
+  auto stream = at::cuda::getCurrentCUDAStream();
   at::Tensor ws = at::empty({int64_t(kWorkspace)}, x.options().dtype(at::kByte));
-  LT_CHECK(cublasLtMatmul(lt_handle(), plan->op, &alpha, w.data_ptr(), plan->a,
-                          x.data_ptr(), plan->b, &beta, residual ? residual->data_ptr() : y.data_ptr(), plan->c,
-                          y.data_ptr(), plan->c, &plan->algo, ws.data_ptr(), kWorkspace,
-                          at::cuda::getCurrentCUDAStream()));
+  const AlgoKey key{x.get_device(), m_bucket(M), N, K, w.stride(0), x.stride(0), int(epi), int(c != nullptr),
+                    int(in_t), int(out_t), 0};
+  cublasLtMatmulAlgo_t algo;
+  if (c && c->data_ptr() == d.data_ptr()) {
+    // In place: timing runs must not touch the accumulator.
+    bool cached;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      cached = g_algos.count(key) != 0;
+    }
+    at::Tensor scratch = cached ? d : at::empty_like(d);
+    Problem tp = p;
+    tp.D = scratch.data_ptr();
+    algo = select_algo(key, tp, ws.data_ptr(), stream);
+  } else {
+    algo = select_algo(key, p, ws.data_ptr(), stream);
+  }
+  LT_CHECK(run(p, &algo, ws.data_ptr(), stream));
+}
+
+}  // namespace
+
+at::Tensor gemm(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias,
+                const std::optional<at::Tensor>& residual, Epilogue epilogue,
+                std::optional<at::ScalarType> out_dtype) {
+  const at::ScalarType odt = residual ? residual->scalar_type() : out_dtype.value_or(x.scalar_type());
+  at::Tensor y = at::empty({x.size(0), w.size(0)}, x.options().dtype(odt));
+  gemm_impl(x, w, bias, residual ? &*residual : nullptr, y, epilogue);
   return y;
+}
+
+void gemm_accumulate(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias,
+                     at::Tensor& acc) {
+  gemm_impl(x, w, bias, &acc, acc, Epilogue::None);
 }
 
 void gemm_f32_batched(const at::Tensor& a, const at::Tensor& b, at::Tensor& out, bool accumulate) {
@@ -227,29 +264,39 @@ void gemm_f32_batched(const at::Tensor& a, const at::Tensor& b, at::Tensor& out,
   const int64_t B = a.size(0), M = a.size(1), K = a.size(2), N = b.size(2);
   WEMM_CHECK(b.size(0) == B && b.size(1) == K && out.size(0) == B && out.size(1) == M && out.size(2) == N,
              "gemm_f32_batched: shape mismatch");
+  WEMM_CHECK(B <= INT32_MAX, "gemm_f32_batched: batch too large");
   if (B == 0) return;
+  c10::cuda::CUDAGuard guard(a.device());
   // Column-major: out^T[N,M] = b^T[N,K] * a^T[K,M]; both operands untransposed.
-  cublasLtMatmulDesc_t op;
-  LT_CHECK(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F_PEDANTIC, CUDA_R_32F));
-  cublasLtMatrixLayout_t la, lb, lc;
-  LT_CHECK(cublasLtMatrixLayoutCreate(&la, CUDA_R_32F, N, K, N));
-  LT_CHECK(cublasLtMatrixLayoutCreate(&lb, CUDA_R_32F, K, M, K));
-  LT_CHECK(cublasLtMatrixLayoutCreate(&lc, CUDA_R_32F, N, M, N));
-  const int32_t bc = int32_t(B);
-  const int64_t sa = K * N, sb = M * K, sc = M * N;
-  for (auto [l, stride] : {std::pair{la, sa}, std::pair{lb, sb}, std::pair{lc, sc}}) {
-    LT_CHECK(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &bc, sizeof(bc)));
-    LT_CHECK(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride, sizeof(stride)));
-  }
-  const float alpha = 1.f, beta = accumulate ? 1.f : 0.f;
+  OpDesc op(CUBLAS_COMPUTE_32F_PEDANTIC, CUDA_R_32F);
+  Layout la(CUDA_R_32F, N, K, N), lb(CUDA_R_32F, K, M, K), lc(CUDA_R_32F, N, M, N);
+  la.batch(int32_t(B), K * N);
+  lb.batch(int32_t(B), M * K);
+  lc.batch(int32_t(B), M * N);
+  Problem p{op.d, la.l, lb.l, lc.l, b.data_ptr(), a.data_ptr(), out.data_ptr(), out.data_ptr(), accumulate ? 1.f : 0.f};
+  auto stream = at::cuda::getCurrentCUDAStream();
   at::Tensor ws = at::empty({int64_t(kWorkspace)}, a.options().dtype(at::kByte));
-  LT_CHECK(cublasLtMatmul(lt_handle(), op, &alpha, b.data_ptr(), la, a.data_ptr(), lb,
-                          &beta, out.data_ptr(), lc, out.data_ptr(), lc, nullptr, ws.data_ptr(), kWorkspace,
-                          at::cuda::getCurrentCUDAStream()));
-  cublasLtMatrixLayoutDestroy(la);
-  cublasLtMatrixLayoutDestroy(lb);
-  cublasLtMatrixLayoutDestroy(lc);
-  cublasLtMatmulDescDestroy(op);
+  // Not autotuned (the heuristic pick is fine for these small batched tiles);
+  // cache it so the heuristic runs once per shape bucket.
+  const AlgoKey key{a.get_device(), m_bucket(B), M, N, K, 0, -1, int(accumulate), int(CUDA_R_32F), int(CUDA_R_32F), 1};
+  cublasLtMatmulAlgo_t algo;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto it = g_algos.find(key);
+    cublasLtMatmulHeuristicResult_t chk{};
+    if (it != g_algos.end() &&
+        cublasLtMatmulAlgoCheck(lt_handle(), p.op, p.a, p.b, p.c, p.c, &it->second, &chk) == CUBLAS_STATUS_SUCCESS) {
+      algo = it->second;
+    } else {
+      Pref pref;
+      cublasLtMatmulHeuristicResult_t res{};
+      int n = 0;
+      LT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_handle(), p.op, p.a, p.b, p.c, p.c, pref.p, 1, &res, &n));
+      WEMM_CHECK(n > 0, "gemm_f32_batched: no cuBLASLt algorithm");
+      algo = g_algos[key] = res.algo;
+    }
+  }
+  LT_CHECK(run(p, &algo, ws.data_ptr(), stream));
 }
 
 }  // namespace wemm

@@ -6,7 +6,7 @@ WeMM-Embedding の推論を **Python 不要** の C++ ネイティブ実装に�
 
 | 処理 | 実装 |
 | --- | --- |
-| モデル (Qwen3.5: Gated DeltaNet + Gated Attention, ViT) | LibTorch (ATen) + 自前 CUDA カーネル + cuBLASLt + FlashAttention (LibTorch 同梱) |
+| モデル (Qwen3.5: Gated DeltaNet + Gated Attention, ViT) | LibTorch (ATen) + 自前 CUDA カーネル + cuBLASLt + FlashAttention / memory-efficient attention (LibTorch 同梱) |
 | 重み | Hugging Face の `model.safetensors` を mmap で直接読み込み（変換不要） |
 | トークナイザ | Hugging Face `tokenizers` (Rust) を C ABI で静的リンク |
 | 画像デコード | OpenCV (`imdecode`) |
@@ -16,86 +16,94 @@ WeMM-Embedding の推論を **Python 不要** の C++ ネイティブ実装に�
 
 目的は「ネイティブ化による高速化」と「精度の維持」の両立です。前処理は
 Transformers 5.2 + qwen-vl-utils 0.0.14（リポジトリ推奨構成）と**ビット単位で一致**し、
-モデル出力はリファレンス (Transformers bf16) よりも **fp32 モデルに近い** 埋め込みを返します。
+埋め込みはリファレンス (Transformers bf16) よりも**約 30 倍 fp32 モデルに近い**値を返します。
+対応 GPU は Turing (sm_75) 〜 Blackwell (sm_120) です。
 
-## 結果の概要 (RTX 3090, CUDA 13.0, WeMM-Embedding-2B)
+## 結果の概要 (RTX 3090, CUDA 13.0)
 
 結果はすべて `tests/test_reference.cpp` / `apps/wemm_bench.cpp` / `tools/*.py` で再現できます
 （下の「検証」節を参照）。
 
 ### 精度
 
-`1 - cos(埋め込み, fp32 モデルの埋め込み)`（小さいほど良い）。fp32 参照は
+`1 - cos(埋め込み, fp32 モデルの埋め込み)`（小さいほど良い、平均 / 最大）。fp32 参照は
 Transformers の純 PyTorch 実装を TF32 無効の真の fp32 で実行したもの。
 
-| モデル | fp32 参照のあるケース | Transformers bf16（平均 / 最大） | **ネイティブ**（平均 / 最大） | 誤差の比 | ネイティブが近いケース |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 2B | 20 | 1.13e-3 / 7.04e-3 | **2.77e-4 / 5.83e-4** | 1/4.1 | 20 / 20 |
-| 4B | 19 | 1.31e-3 / 5.67e-3 | **3.78e-4 / 2.62e-3** | 1/3.5 | 19 / 19 |
-| 9B | 6（fp32 は CPU で計算） | 8.24e-4 / 2.38e-3 | **2.95e-4 / 8.56e-4** | 1/2.8 | 6 / 6 |
+| モデル | fp32 参照のあるケース | Transformers bf16 | ネイティブ bf16 | **ネイティブ fp16（既定）** |
+| --- | ---: | ---: | ---: | ---: |
+| 2B | 22 | 1.23e-3 / 7.04e-3 | 3.29e-4 / 1.41e-3 | **3.66e-5 / 1.72e-4** |
+| 4B | 19 | 1.31e-3 / 5.67e-3 | 3.32e-4 / 2.56e-3 | **4.35e-5 / 3.29e-4** |
+| 9B | 6（fp32 は CPU で計算） | 8.24e-4 / 2.38e-3 | 2.88e-4 / 8.71e-4 | **2.90e-5 / 1.21e-4** |
+
+ネイティブ fp16 は全ケースで Transformers bf16 より fp32 モデルに近く、平均誤差は約 1/30 です。
+理由は 2 つあります。
+
+- **fp32 残差ストリーム**: ViT と LM の残差を fp32 で保持し、GEMM のエピローグで直接 fp32 に加算する。
+- **fp16 演算**: bf16 のチェックポイントは fp16 に誤差なく変換でき、fp16 は仮数部が 10bit（bf16 は 7bit）。
+  RTX 3090 ではテンソルコア速度は bf16 と同じです。16bit で保持する中間値の最大は 1275 で、
+  fp16 の上限 65504 に対して十分な余裕があります（全モデル・全ケースで計測）。
+  オーバーフローが起きた場合は非有限値を検知してエラーにします（`compute_dtype=bf16` に切り替えられます）。
 
 <details>
 <summary>2B のケース別（1 − cos、fp32 モデル基準）</summary>
 
-| ケース | 内容 | Transformers bf16 | ネイティブ |
-| --- | --- | ---: | ---: |
-| text | 短文 (13 tok) | 5.2e-5 | 8.0e-6 |
-| text_long | 長文・多言語・絵文字 (962 tok) | 6.3e-5 | 2.0e-5 |
-| system | system + user | 5.8e-5 | 1.0e-5 |
-| image | 298×224 JPEG | 7.6e-4 | 2.6e-4 |
-| image_small | 200×150 PNG（2 段リサイズ） | 5.1e-4 | 6.3e-5 |
-| image_chart | 850×600 WebP | 1.4e-3 | 5.8e-4 |
-| image_large | 1700×1200 JPEG (2020 tok) | 8.9e-4 | 3.3e-4 |
-| image_pixels | `min/max_pixels` 指定 | 7.0e-3 | 5.8e-4 |
-| image_text | 画像 + テキスト | 4.1e-4 | 1.4e-4 |
-| multi_image | テキスト・画像 2 枚の交互配置 | 1.3e-3 | 5.3e-4 |
-| rgba / palette / gray / exif | RGBA PNG・パレット PNG・グレー JPEG・EXIF 回転 JPEG | 8.3e-4 / 6.4e-4 / 7.2e-4 / 2.3e-4 | 1.8e-4 / 1.1e-4 / 5.8e-5 / 6.7e-5 |
-| video | 298×224, 41 frames (1485 tok) | 1.9e-3 | 4.5e-4 |
-| video_long | 640×360, 360 frames (2743 tok) | 9.6e-4 | 5.3e-4 |
-| video_nframes | `nframes=64` (7307 tok) | 7.9e-4 | 2.6e-4 |
-| video_segment | `video_start/end` + `fps=1` | 8.8e-4 | 4.0e-4 |
-| text_video / image_video | テキスト + 動画 / 画像 + 動画 | 1.4e-3 / 1.7e-3 | 4.0e-4 / 5.5e-4 |
+| ケース | 内容 | Transformers bf16 | ネイティブ bf16 | ネイティブ fp16 |
+| --- | --- | ---: | ---: | ---: |
+| text | 短文 (13 tok) | 5.2e-5 | 9.0e-6 | 0 |
+| text_long | 長文・多言語・絵文字 (962 tok) | 6.3e-5 | 1.8e-5 | 0 |
+| system | system + user | 5.8e-5 | 1.0e-5 | 0 |
+| image | 298×224 JPEG | 7.6e-4 | 2.6e-4 | 1.1e-5 |
+| image_small | 200×150 PNG（2 段リサイズ） | 5.1e-4 | 5.9e-5 | 2.3e-5 |
+| image_chart | 850×600 WebP | 1.4e-3 | 5.8e-4 | 4.7e-5 |
+| image_large | 1700×1200 JPEG (2020 tok) | 8.9e-4 | 3.3e-4 | 1.6e-5 |
+| image_pixels | `min/max_pixels` 指定 | 7.0e-3 | 5.8e-4 | 2.9e-5 |
+| image_text | 画像 + テキスト | 4.1e-4 | 1.3e-4 | 6.0e-6 |
+| multi_image | テキスト・画像 2 枚の交互配置 | 1.3e-3 | 6.6e-4 | 1.0e-4 |
+| rgba / palette / gray | RGBA PNG・パレット PNG・グレー JPEG | 8.3e-4 / 6.4e-4 / 7.2e-4 | 1.7e-4 / 1.1e-4 / 5.9e-5 | 1.2e-5 / 1.5e-5 / 1.7e-5 |
+| exif / rgb16 / gray16 | EXIF 回転 JPEG・16bit RGB/グレー PNG | 2.3e-4 / 7.3e-4 / 3.9e-3 | 6.8e-5 / 2.2e-4 / 1.4e-3 | 3.5e-5 / 3.2e-5 / 1.7e-4 |
+| video | 298×224, 41 frames (1485 tok) | 1.9e-3 | 4.5e-4 | 7.4e-5 |
+| video_long | 640×360, 360 frames (2743 tok) | 9.6e-4 | 5.5e-4 | 2.3e-5 |
+| video_nframes | `nframes=64` (7307 tok) | 7.9e-4 | 2.3e-4 | 2.0e-5 |
+| video_segment | `video_start/end` + `fps=1` | 8.8e-4 | 4.0e-4 | 5.5e-5 |
+| text_video / image_video | テキスト + 動画 / 画像 + 動画 | 1.4e-3 / 1.6e-3 | 4.0e-4 / 5.3e-4 | 5.7e-5 / 6.1e-5 |
 
 </details>
 
-参考: bf16 で計算する以上、GEMM のアルゴリズム差（バッチ構成で変わる）だけで 1e-4 程度の
-揺らぎは生じます（ネイティブの単体実行とバッチ実行の差も同程度）。
-
 前処理（チャットテンプレート、トークン列、`pixel_values` / `pixel_values_videos`、
-グリッド、動画タイムスタンプ）は 2B/4B/9B の全ケース（RGBA 合成・パレット PNG・
-グレースケール・EXIF 付き JPEG・固定フレーム数/区間指定の動画・複数画像・system
-メッセージを含む）で参照と**完全一致**（差 0）しています。
+グリッド、動画タイムスタンプ）は 2B/4B/9B の全ケースで参照と**完全一致**（差 0）しています。
+対象は上表のすべてのケースで、RGBA 合成・パレット PNG・グレースケール・EXIF 付き JPEG・16bit PNG・
+固定フレーム数/区間指定の動画・複数画像・system メッセージを含みます。
 
 ### 速度
 
-環境: RTX 3090 (24 GB), Driver 580 / CUDA 13.0, LibTorch 2.10.0+cu130。
-ベースラインは Transformers 5.2.0（推奨構成）+ flash-linear-attention 0.5.2（FLA 有りが速い方の比較対象）。
+環境: RTX 3090 (24 GB), Driver 580 / CUDA 13.0, 公式 LibTorch 2.10.0+cu130。
+ベースラインは Transformers 5.2.0（推奨構成）+ flash-linear-attention 0.5.2（FLA 有りの方が速いので比較対象にしています）。
 
 **forward レイテンシ**（バッチ 1、前処理除く、ms）
 
 | 入力 | トークン | Transformers（PyTorch 実装） | Transformers + FLA | **ネイティブ** | FLA 比 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 2B text | 13 | 651 | 42.3 | **6.5** | 6.5× |
-| 2B text_long | 962 | 637 | 69.6 | **55.0** | 1.26× |
-| 2B image | 86 | 655 | 63.9 | **15.3** | 4.2× |
-| 2B image_large | 2020 | 839 | 351.3 | **284.9** | 1.23× |
-| 2B video | 1485 | 695 | 199.1 | **148.2** | 1.34× |
-| 2B video_long | 2743 | 808 | 359.6 | **269.2** | 1.34× |
-| 4B text | 13 | – | 63.3 | **13.1** | 4.8× |
-| 4B text_long | 962 | – | 150.4 | **133.4** | 1.13× |
-| 4B image | 86 | – | 76.7 | **25.6** | 3.0× |
-| 4B image_large | 2020 | – | 517.3 | **443.6** | 1.17× |
-| 4B video | 1485 | – | 332.5 | **270.4** | 1.23× |
-| 4B video_long | 2743 | – | 578.3 | **493.6** | 1.17× |
-| 9B text | 13 | – | 54.7 | **20.8** | 2.6× |
-| 9B text_long | 962 | – | 262.8 | **231.5** | 1.14× |
-| 9B image | 86 | – | 83.3 | **41.3** | 2.0× |
-| 9B image_large | 2020 | – | 823.6 | **729.1** | 1.13× |
-| 9B video | 1485 | – | 515.4 | **439.7** | 1.17× |
-| 9B video_long | 2743 | – | 908.4 | **806.9** | 1.13× |
+| 2B text_long | 962 | 637 | 69.6 | **55.2** | 1.26× |
+| 2B image | 86 | 655 | 63.9 | **15.2** | 4.2× |
+| 2B image_large | 2020 | 839 | 351.3 | **287.1** | 1.22× |
+| 2B video | 1485 | 695 | 199.1 | **150.4** | 1.32× |
+| 2B video_long | 2743 | 808 | 359.6 | **272.3** | 1.32× |
+| 4B text | 13 | – | 63.3 | **13.0** | 4.9× |
+| 4B text_long | 962 | – | 150.4 | **134.8** | 1.12× |
+| 4B image | 86 | – | 76.7 | **25.4** | 3.0× |
+| 4B image_large | 2020 | – | 517.3 | **449.9** | 1.15× |
+| 4B video | 1485 | – | 332.5 | **272.4** | 1.22× |
+| 4B video_long | 2743 | – | 578.3 | **498.3** | 1.16× |
+| 9B text | 13 | – | 54.7 | **21.1** | 2.6× |
+| 9B text_long | 962 | – | 262.8 | **234.4** | 1.12× |
+| 9B image | 86 | – | 83.3 | **41.1** | 2.0× |
+| 9B image_large | 2020 | – | 823.6 | **739.2** | 1.11× |
+| 9B video | 1485 | – | 515.4 | **442.6** | 1.16× |
+| 9B video_long | 2743 | – | 908.4 | **806.7** | 1.13× |
 
-短い入力（検索クエリ等）は起動オーバーヘッドとカーネル融合の効果で数倍速くなります。
-長い入力は GEMM（約 65 TFLOPS、bf16/fp32 累積のピーク付近）と ViT の注意が支配的で、
+短い入力（検索クエリなど）は、起動オーバーヘッドの削減とカーネル融合の効果で数倍速くなります。
+長い入力は GEMM（約 65 TFLOPS、16bit/fp32 累積のピーク付近）と ViT の注意が支配的です。
 ネイティブ版は fp32 残差のぶん余計な計算をしたうえで 1.1〜1.3 倍です。
 
 **前処理**（2B、1 入力、ms）
@@ -111,12 +119,38 @@ Transformers の純 PyTorch 実装を TF32 無効の真の fp32 で実行した�
 
 | ワークロード | Transformers + FLA | **ネイティブ** | 比 |
 | --- | ---: | ---: | ---: |
-| テキスト 512 件（8〜256 語、バッチ 32） | 64.2 件/s | **206.6 件/s** | 3.2× |
-| 画像 64 件（4 種のサイズ、バッチ 8） | 3.7 件/s | **11.6 件/s** | 3.1× |
-| 動画 16 件（バッチ 4） | 1.4 件/s | **4.2 件/s** | 3.0× |
+| テキスト 512 件（8〜256 語、バッチ 32） | 64.2 件/s | **200.7 件/s** | 3.1× |
+| 画像 64 件（4 種のサイズ、バッチ 8） | 3.7 件/s | **11.4 件/s** | 3.1× |
+| 動画 16 件（バッチ 4） | 1.4 件/s | **4.1 件/s** | 2.9× |
 
-ネイティブ版はパディング無しの可変長パッキングと、前処理の GPU 計算とのオーバーラップを使います。
-（Transformers の「PyTorch 実装」列は FLA 未導入時の既定経路。NGC コンテナ既定の TF32 有効状態で計測。）
+ネイティブ版はパディング無しの可変長パッキングを使い、前処理を GPU 計算と重ねて実行します。
+（Transformers の「PyTorch 実装」列は FLA 未導入時の既定経路で、NGC コンテナ既定の TF32 有効状態で計測しています。）
+
+### GPU メモリ
+
+**常駐量とピーク**（GiB、`torch.cuda.max_memory_allocated` 相当）
+
+| モデル | Transformers bf16: ロード後 / video_long ピーク | **ネイティブ: ロード後 / video_long ピーク** | ピーク削減 |
+| --- | ---: | ---: | ---: |
+| 2B | 5.07 / 5.55 | **3.18 / 3.53** | −36% |
+| 4B | 9.80 / 10.32 | **7.28 / 7.84** | −24% |
+| 9B | 17.60 / 18.16 | **13.75 / 14.33** | −21% |
+
+**大きなバッチ**（2B、1005 トークン × 32 本）: 改善前はピーク 7.67 GiB・予約 9.24 GiB でしたが、
+**ピーク 5.12 GiB・予約 5.59 GiB** になりました（速度は ±1% 以内）。
+約 2 万トークンの単一入力でも、ピークは 4.57 GiB です。
+
+効いている施策は次のとおりです（すべて計算結果は不変です）。
+
+- **埋め込み表を GPU に置かない**: 1〜2 GB の表は mmap したホストメモリに残し、参照する行だけをピン留めバッファ経由で転送します
+  （`embeddings_on_gpu=true` で従来どおり VRAM に置けます。2B / 4B / 9B でそれぞれ 0.95 / 1.18 / 1.89 GiB 削減）。
+- **`lm_head` と MTP の重みを読まない**: Transformers との差のうち約 1〜2 GB はこれによるものです。
+- **GDN をチャンクの時間窓で処理**: 窓をまたぐ系列は状態を持ち越します。fp32 の作業領域は
+  `gdn_window_bytes`（既定 512 MiB）で上限化されます。窓なしの場合と結果はビット単位で同一です。
+- **MLP を行ブロック単位で処理**（`mlp_chunk_tokens`、既定 8192）。
+- **残差の in-place 加算**: GEMM のエピローグで残差に直接加算するので、層ごとに残差を複製しません。
+- **ロード時の一時領域を解放**: 融合する重みはホスト側で結合してから 1 回だけ転送し、ロード後にキャッシュを空にします。
+- **expandable segments**: caching allocator の断片化を抑えます（`PYTORCH_CUDA_ALLOC_CONF` が未設定の場合のみ有効）。
 
 ## 構成
 
@@ -126,12 +160,17 @@ native/
 ├── include/wemm/           公開ヘッダ
 │   ├── embedder.h          高レベル API（前処理 + バッチ化 + モデル）
 │   ├── processor.h         チャットテンプレート / 画像・動画前処理 / トークナイズ / M-RoPE
-│   ├── model.h             LibTorch モデル（ViT + Qwen3.5 LM）
+│   ├── model.h             LibTorch モデル（ViT + Qwen3.5 LM）と ModelOptions
 │   ├── c_api.h             C ABI（他言語バインディング用）
 │   ├── media.h             OpenCV / FFmpeg / Pillow 互換リサイズ
 │   ├── gemm.h              cuBLASLt ラッパ（エピローグ融合・オートチューニング）
 │   └── kernels.h           自前 CUDA カーネル
-├── src/                    実装（src/kernels/*.cu が CUDA カーネル）
+├── src/
+│   ├── model.cpp           重みロード、バッチ毎の前計算（RoPE 表・パッキング）、ディスパッチ
+│   ├── model_fused.cpp     既定の実装（融合カーネル・cuBLASLt・fp32 残差・作業領域の上限化）
+│   ├── model_reference.cpp 検証用の素の ATen 実装（Transformers の計算をそのまま追う）
+│   ├── kernels/            CUDA カーネル（fused.cu: norm/RoPE/ゲート等、gdn.cu: Gated DeltaNet）
+│   └── ...                 前処理・メディア・GEMM・C ABI など
 ├── tokenizers-ffi/         HF tokenizers (Rust) の C ABI ラッパ（ビルド時のみ cargo が必要）
 ├── apps/wemm_embed.cpp     CLI
 ├── apps/wemm_bench.cpp     レイテンシ計測
@@ -143,7 +182,8 @@ native/
 
 ### 必要なもの
 
-- NVIDIA GPU: Ampere 以降 (sm_80+)。bf16 と `cp.async` を使用します。
+- NVIDIA GPU: Turing (sm_75) 以降。sm_75 では fp16 + memory-efficient attention、
+  単一バッファの GDN 状態カーネルを使います（いずれも 3090 上で同じ経路を強制して検証済み）。
 - CUDA Toolkit 13.0（`nvcc`, cuBLASLt）
 - LibTorch 2.10.0 + cu130（公式配布の `libtorch-shared-with-deps-2.10.0+cu130.zip`）
 - OpenCV 4（core / imgproc / imgcodecs）
@@ -168,7 +208,7 @@ unzip libtorch-shared-with-deps-2.10.0+cu130.zip
 ```bash
 cmake -S native -B build -G Ninja \
   -DCMAKE_PREFIX_PATH=$PWD/libtorch \
-  -DTORCH_CUDA_ARCH_LIST="8.6"          # 省略時は 8.0;8.6;8.9;9.0;10.0;12.0+PTX
+  -DTORCH_CUDA_ARCH_LIST="8.6"          # 省略時は 7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX
 cmake --build build
 ```
 
@@ -243,6 +283,22 @@ at::Tensor e = emb.embed(convs);
 `Embedder::embed` は入力を CPU スレッドで前処理しつつ（次グループの前処理を GPU 計算と並行）、
 トークン長でソートしてパディング無しの可変長バッチに詰めて GPU に流します。
 
+### 主なオプション（`wemm::EmbedderOptions` / `wemm::ModelOptions`）
+
+| オプション | 既定 | 内容 |
+| --- | --- | --- |
+| `compute_dtype` | fp16 | 重み・活性の 16bit 型。bf16 は sm_80+ のみ |
+| `attention` | Auto | FlashAttention (sm_80+) / memory-efficient attention (sm_75) |
+| `fp32_residual` | true | 残差ストリームを fp32 で保持 |
+| `embeddings_on_gpu` | false | 埋め込み表を VRAM に置く（既定は mmap したホストメモリ） |
+| `gdn_window_bytes` | 512 MiB | GDN 1 層あたりの fp32 作業領域の上限 |
+| `mlp_chunk_tokens` | 8192 | MLP を処理する行ブロック |
+| `max_batch_tokens` | 32768 | 1 回の forward に詰めるトークン数 |
+| `fused_kernels` | true | false で検証用の ATen 参照実装 |
+| `intra_op_threads` | 16 | 画像/動画リサイズの ATen CPU スレッド数（プロセス全体の設定） |
+
+C ABI では `wemm_create` の `options_json` に同名のキーを指定できます（`"compute_dtype": "bf16"` など）。
+
 ### C ABI
 
 `include/wemm/c_api.h` を参照（`tests/test_c_api.c` が使用例）。
@@ -276,31 +332,39 @@ wemm_destroy(e);
 
 ### モデル
 
-- 重みは safetensors から直接ロード。埋め込みには不要な `lm_head` と MTP の重みは読みません
-  （2B で約 1 GB の GPU メモリ削減）。
-- 複数入力は**パディング無しの可変長パッキング**で 1 回の forward にまとめます
-  （FlashAttention varlen、GDN は系列境界で状態をリセット、conv1d は系列先頭でゼロ埋め）。
-- **最終層は `<embedding>` トークン行だけを計算**（最終層の注意クエリ・MLP・norm を N 行に限定）。
-- Gated DeltaNet（線形注意 18 層）:
-  - 融合カーネル `gdn_chunk_prepare`: conv 出力からチャンク (64) 単位で q/k/v を集め、L2 正規化、
-    `g = -exp(A)·softplus(a+dt_bias)`、`β = sigmoid(b)`、チャンク内累積減衰、
-    WY 表現 `(I + tril(βKKᵀ⊙decay))⁻¹`（16×16 ブロック分割の三角逆行列）、
-    float4 + レジスタタイリング。
-  - 状態伝播カーネル: 状態 S を レジスタ常駐、次チャンクの `w`/`kd`/`u` を `cp.async` で先読み。
-  - チャンク毎の出力は並列な fp32 バッチ GEMM（cuBLASLt, `COMPUTE_32F_PEDANTIC`）。
-  - すべて **fp32** で計算（Transformers の参照実装と同じ精度。fp64 の逐次再帰に対し相対誤差 ~1e-6）。
-- 融合カーネル: RMSNorm / LayerNorm（fp32 入力 → bf16 出力）、q/k の head RMSNorm + 部分 RoPE、
+- 重みは safetensors から直接ロードします。埋め込みには不要な `lm_head` と MTP の重みは読みません。
+- 実装は 2 つあり、`model.cpp` がバッチ毎の前計算を共有したうえで振り分けます。
+  - `model_fused.cpp`: 既定の融合カーネル実装。
+  - `model_reference.cpp`: 素の ATen で Transformers の計算を追う検証用実装で、カーネルの検証に使います。
+- 複数入力は**パディング無しの可変長パッキング**で 1 回の forward にまとめます。
+  注意は varlen、GDN は系列境界で状態をリセット、conv1d は系列先頭でゼロ埋めします。
+- **最終層は `<embedding>` トークンの行だけを計算**します（最終層の注意クエリ・MLP・norm を N 行に限定）。
+- Gated DeltaNet（線形注意層）:
+  - **準備カーネル** `gdn_chunk_prepare`（チャンク×ヘッド並列）。
+    - チャンク (64) 単位で conv 出力から q/k/v を集め、L2 正規化します。
+    - `g = -exp(A)·softplus(a+dt_bias)` と `β = sigmoid(b)`、チャンク内の累積減衰を計算します。
+    - WY 表現 `(I + tril(βKKᵀ⊙decay))⁻¹` を 16×16 ブロック分割の三角逆行列で求めます。
+    - 64×128 タイルを列方向に半分ずつ処理するので、共有メモリは約 54 KB で sm_75 にも収まります。
+  - **状態伝播カーネル**: 状態 S をレジスタに常駐させます。
+    sm_80+ では次チャンクの `w` / `kd` / `u` を `cp.async` で先読みし（96 KB）、
+    それ以外は単一バッファ（64 KB）で処理します。両者の結果はビット単位で同一です。
+  - **チャンク毎の出力**: 並列な fp32 バッチ GEMM で計算します（cuBLASLt, `COMPUTE_32F_PEDANTIC`）。
+  - **時間窓処理**: 長い入力はチャンクの窓に分けて処理し、窓をまたぐ状態は持ち越します。
+  - すべて **fp32** で計算します（Transformers の参照実装と同じ精度。fp64 の逐次再帰に対する相対誤差は約 1e-6）。
+- 融合カーネル: RMSNorm / LayerNorm（fp32 入力 → 16bit 出力）、q/k の head RMSNorm + 部分 RoPE、
   シグモイドゲート、SiLU×up、ゲート付き RMSNorm、ViT の 2D RoPE、varlen causal conv1d + SiLU。
-- GEMM は cuBLASLt を直接呼び、**bias / GELU(tanh) / 残差加算をエピローグに融合**。
-  形状バケット毎にアルゴリズムを実測オートチューニング（`WEMM_GEMM_AUTOTUNE=0` で無効化）。
-  線形注意の入力射影 (qkv|z|b|a) と MLP の gate|up は 1 つの GEMM に結合し、出力次元を 128 の倍数にパディング。
-- **fp32 残差ストリーム**（既定で有効）: ViT と LM の残差を fp32 で保持し、GEMM エピローグで
-  fp32 に直接加算。bf16 の残差よりも丸め誤差の蓄積が小さく、fp32 モデルとの誤差が
-  約 1/3〜1/5 になります（コストは数 %）。`ModelOptions::fp32_residual=false` で bf16 残差。
-- ATen の fp32 matmul は NGC コンテナの `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1` で TF32 に
-  落とされるため、fp32 が必要な箇所は cuBLASLt を計算型明示で呼んでいます。
-- 自前の cuBLASLt ハンドルを使用（公式 LibTorch は名前を変えた cuBLASLt を同梱しているため、
-  ATen のハンドルとリンク先ライブラリを混在させない）。
+  いずれも bf16 / fp16 のテンプレートです。
+- GEMM は cuBLASLt を直接呼び、**bias / GELU(tanh) / 残差加算をエピローグに融合**します。
+  - 残差は in-place で加算します。
+  - 形状バケット毎にアルゴリズムを実測でオートチューニングします（`WEMM_GEMM_AUTOTUNE=0` で無効化）。
+  - 記述子は呼び出し毎に作るので、スレッドセーフです。
+  - 線形注意の入力射影 (qkv|z|b|a) と MLP の gate|up はそれぞれ 1 つの GEMM に結合し、出力次元を 128 の倍数にパディングしています。
+- 注意: sm_80+ では FlashAttention-2（GQA ネイティブ）を使います。
+  sm_75 では memory-efficient attention を使い、KV ヘッドは複製します。
+- ATen の fp32 matmul は、NGC コンテナの `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1` によって TF32 に落とされます。
+  このため fp32 が必要な箇所は、計算型を明示して cuBLASLt を呼んでいます。
+- cuBLASLt のハンドルは自前でデバイス毎に持ちます。公式 LibTorch は名前を変えた cuBLASLt を同梱しているので、
+  ATen のハンドルとリンク先ライブラリを混在させないためです。
 
 ### CPU 側
 
@@ -325,15 +389,20 @@ Transformers を実行し、プロンプト・トークン列・画素テンソ�
 
 その他:
 
-- `wemm_bench_gdn [len...]`: GDN カーネルを fp64 の逐次再帰と比較し、時間を計測。
+- `wemm_bench_gdn [len...]`: GDN カーネルを検証して時間を計測します。fp64 の逐次再帰と比較するほか、
+  単一バッファ版（sm_75 経路）と時間窓分割版が通常版とビット一致することも確認します。
+- `wemm_test_reference ... --fp16 | --bf16 | --mem-efficient | --unfused | --emb-gpu | --gdn-window N`:
+  各経路を個別に検証します（sm_75 経路は `--fp16 --mem-efficient`）。
 - `wemm_bench_gemm`: 主要 GEMM 形状で cuBLASLt 経路と ATen を比較。
 - `tools/bench_hf.py`, `tools/bench_throughput_hf.py`: Transformers のベースライン計測。
 
 ## 制限事項
 
-- 音声入力は元モデル同様に非対応。
-- GPU は Ampere 以降 (sm_80+) のみ。1 つの `Embedder` を複数スレッドから同時に呼ばないでください。
-- 画像デコーダの差異: OpenCV は 4ch PNG をすべて RGBA として扱うため、透過付きパレット PNG や
-  LA 画像は（PIL がアルファを捨てる場合でも）白背景合成になります。16bit 画像は上位 8bit を使用します。
+- 音声入力は元モデル同様に非対応です。
+- GPU は Turing (sm_75) 以降です。sm_75 の経路は 3090 上で同じコードを強制して検証しましたが、Turing 実機では未検証です。
+- 1 つの `Embedder` を複数スレッドから同時に呼ばないでください。
+- 画像デコーダの差異: OpenCV は 4ch PNG をすべて RGBA として扱います。そのため透過付きパレット PNG と
+  LA 画像は、PIL がアルファを捨てる場合でも白背景で合成されます。
 - 動画のフレーム数はコンテナの `nb_frames`（無い場合は長さ×fps）を使います（decord と同じ）。
-  可変フレームレートの動画では decord とフレーム番号付けが異なる可能性があります。
+  可変フレームレートの動画では、decord とフレーム番号の付け方が異なる可能性があります。
+- fp16 で万一オーバーフローした場合は、非有限値を検知してエラーにします（`compute_dtype=bf16` を推奨、sm_80+）。

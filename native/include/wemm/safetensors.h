@@ -10,8 +10,8 @@
 namespace wemm {
 
 // Memory-mapped reader for one or more .safetensors files. Tensors returned by
-// `get` are zero-copy CPU views into the mapping and stay valid while the
-// reader is alive.
+// `get` are zero-copy CPU views into the mapping; each keeps its file mapped
+// for as long as the tensor lives (the reader itself may be destroyed).
 class SafeTensors {
  public:
   // `path` is either a single .safetensors file or a model directory holding

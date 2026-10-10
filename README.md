@@ -99,9 +99,9 @@ Equivalent one-command wrappers are available in `scripts/serve_vllm.sh` and `sc
 
 [`native/`](native/README.md) is a Python-free C++ runtime for the same checkpoints: the model runs on
 LibTorch with custom CUDA kernels (CUDA 13.0), tokenization uses the Hugging Face `tokenizers` Rust core,
-and media goes through OpenCV / FFmpeg. Preprocessing is bit-exact with the Transformers pipeline above,
-embeddings are closer to the fp32 model than the Transformers bf16 run, and it is 1.1–6.5× faster per
-forward pass (about 3× end to end). See [native/README.md](native/README.md) (Japanese) for build
+and media goes through OpenCV / FFmpeg (Turing sm_75 through Blackwell). Preprocessing is bit-exact with the
+Transformers pipeline above, embeddings are ~30× closer to the fp32 model than the Transformers bf16 run,
+it is 1.1–6.5× faster per forward pass (about 3× end to end) and uses 21–36% less GPU memory. See [native/README.md](native/README.md) (Japanese) for build
 instructions, usage and measurements.
 
 ```bash

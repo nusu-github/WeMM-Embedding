@@ -1,12 +1,13 @@
 #include "wemm/processor.h"
 
+#include <c10/core/InferenceMode.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <chrono>
 #include <thread>
 
 #include "wemm/common.h"
@@ -42,6 +43,8 @@ int64_t round_by_factor(double number, int64_t factor) { return int64_t(py_round
 int64_t ceil_by_factor(double number, int64_t factor) { return int64_t(std::ceil(number / factor)) * factor; }
 int64_t floor_by_factor(double number, int64_t factor) { return int64_t(std::floor(number / factor)) * factor; }
 
+// qwen-vl-utils reads MODEL_SEQ_LEN (default 128000) to bound video tokens;
+// honoured here for parity.
 double model_seq_len() {
   if (const char* env = std::getenv("MODEL_SEQ_LEN")) return double(int64_t(std::atof(env)));
   return 128000;
@@ -109,10 +112,10 @@ std::string render_content(const std::vector<ContentItem>& content) {
   for (const auto& item : content) {
     switch (item.type) {
       case ContentItem::Type::Image:
-        out += "<|vision_start|><|image_pad|><|vision_end|>";
+        out += std::string(kVisionStart) + kImagePad + kVisionEnd;
         break;
       case ContentItem::Type::Video:
-        out += "<|vision_start|><|video_pad|><|vision_end|>";
+        out += std::string(kVisionStart) + kVideoPad + kVisionEnd;
         break;
       case ContentItem::Type::Text:
         out += item.text;
@@ -128,6 +131,7 @@ std::string render_content(const std::vector<ContentItem>& content) {
 std::pair<int64_t, int64_t> qwen_smart_resize(int64_t height, int64_t width, int64_t factor, double min_pixels,
                                               double max_pixels) {
   WEMM_CHECK(max_pixels >= min_pixels, "max_pixels must be >= min_pixels");
+  WEMM_CHECK(std::min(height, width) > 0, "empty image");
   WEMM_CHECK(double(std::max(height, width)) / double(std::min(height, width)) <= kMaxRatio,
              "absolute aspect ratio must be smaller than ", kMaxRatio);
   int64_t h_bar = std::max(factor, round_by_factor(double(height), factor));
@@ -146,8 +150,9 @@ std::pair<int64_t, int64_t> qwen_smart_resize(int64_t height, int64_t width, int
 
 std::pair<int64_t, int64_t> hf_image_smart_resize(int64_t height, int64_t width, int64_t factor,
                                                   int64_t min_pixels, int64_t max_pixels) {
-  WEMM_CHECK(double(std::max(height, width)) / double(std::min(height, width)) <= 200,
-             "absolute aspect ratio must be smaller than 200");
+  WEMM_CHECK(std::min(height, width) > 0, "empty image");
+  WEMM_CHECK(double(std::max(height, width)) / double(std::min(height, width)) <= kMaxRatio,
+             "absolute aspect ratio must be smaller than ", kMaxRatio);
   int64_t h_bar = int64_t(py_round(double(height) / factor)) * factor;
   int64_t w_bar = int64_t(py_round(double(width) / factor)) * factor;
   if (h_bar * w_bar > max_pixels) {
@@ -318,10 +323,7 @@ Visual Processor::load_video(const ContentItem& item) const {
                             : double(start_frame) + double(end_frame - start_frame) * double(i) / double(nframes - 1);
     idx[size_t(i)] = int64_t(py_round(v));
   }
-  static const bool timing = std::getenv("WEMM_TIMING") != nullptr;
-  auto t0 = std::chrono::steady_clock::now();
-  DecodedVideo dec = decode_video_frames(item.source, idx);
-  auto t1 = std::chrono::steady_clock::now();
+  DecodedVideo dec = decode_video_frames(item.source, idx, 0, &info);
 
   // fetch_video resizing
   const int64_t factor = int64_t(pcfg_.patch_size) * pcfg_.merge_size;
@@ -339,13 +341,6 @@ Visual Processor::load_video(const ContentItem& item) const {
   else
     hw = qwen_smart_resize(H, W, factor, min_pixels, max_pixels);
   at::Tensor frames = torch_resize_uint8_via_float(dec.frames, hw.first, hw.second);
-  if (timing) {
-    auto t2 = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "[wemm] video %s: decode %.1f ms (%zu frames), resize %lldx%lld->%lldx%lld %.1f ms\n",
-                 item.source.c_str(), std::chrono::duration<double, std::milli>(t1 - t0).count(), idx.size(),
-                 (long long)H, (long long)W, (long long)hw.first, (long long)hw.second,
-                 std::chrono::duration<double, std::milli>(t2 - t1).count());
-  }
 
   // Qwen3VLVideoProcessor: second smart_resize, float bicubic if the size changes.
   auto hw2 = hf_video_smart_resize(nframes, hw.first, hw.second, pcfg_.temporal_patch_size, factor,
@@ -426,6 +421,7 @@ std::vector<ProcessedSample> Processor::process_batch(const std::vector<Conversa
   std::vector<std::thread> pool;
   for (int t = 0; t < threads; ++t)
     pool.emplace_back([&] {
+      c10::InferenceMode guard;  // thread-local
       for (size_t i; (i = next++) < convs.size();) {
         try {
           out[i] = process(convs[i]);

@@ -74,7 +74,9 @@ using Conversation = std::vector<Message>;
 
 // Final-resolution pixels of one image or video, before normalization.
 struct Visual {
-  at::Tensor frames;  // [T, H, W, 3], uint8 (or float32 in rare re-resize cases), CPU
+  // [T, H, W, 3] CPU. uint8, except float32 when the Transformers video
+  // processor re-resizes already resized frames (rare; values not integral).
+  at::Tensor frames;
   int64_t grid_t = 1, grid_h = 0, grid_w = 0;  // in patches (H/patch, W/patch)
   bool is_video = false;
   // Video metadata (for the prompt timestamps).

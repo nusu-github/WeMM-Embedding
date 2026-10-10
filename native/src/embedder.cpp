@@ -32,6 +32,7 @@ at::Tensor Embedder::embed(const std::vector<Conversation>& inputs, std::optiona
   // Group i+1 is preprocessed while group i runs on the GPU.
   const size_t group = size_t(std::max<int64_t>(1, opts_.max_batch_size));
   auto prep = [this, &inputs](size_t b, size_t e) {
+    c10::InferenceMode guard;  // thread-local
     std::vector<Conversation> part(inputs.begin() + b, inputs.begin() + e);
     return processor_->process_batch(part, opts_.preprocess_threads);
   };
@@ -59,8 +60,15 @@ at::Tensor Embedder::embed(const std::vector<Conversation>& inputs, std::optiona
         batch.push_back(std::move(samples[order[i]]));
         ++i;
       }
-      at::Tensor emb = model_->embed(batch).cpu();
-      for (size_t r = 0; r < rows.size(); ++r) out[int64_t(rows[r])].copy_(emb[int64_t(r)]);
+      at::Tensor emb;
+      try {
+        emb = model_->embed(batch).cpu();
+      } catch (...) {
+        if (next.valid()) next.wait();  // do not leave the prefetch running against `inputs`
+        throw;
+      }
+      std::vector<int64_t> rows64(rows.begin(), rows.end());
+      out.index_copy_(0, at::tensor(rows64, at::kLong), emb);
     }
   }
   if (dimension) {

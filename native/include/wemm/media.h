@@ -9,6 +9,9 @@
 
 namespace wemm {
 
+// "file:///a/b.jpg" -> "/a/b.jpg"; other strings unchanged.
+std::string strip_file_scheme(const std::string& path);
+
 // ---------------------------------------------------------------- images ----
 // Decodes an image file (or encoded bytes) with OpenCV into an RGB uint8 tensor
 // [H, W, 3]. Mirrors qwen-vl-utils `to_rgb`: RGBA inputs are composited onto a
@@ -47,8 +50,9 @@ struct DecodedVideo {
 VideoInfo probe_video(const std::string& path);
 
 // Decodes the given (sorted, possibly repeated) frame indices with FFmpeg and
-// converts them to RGB24 with swscale. `threads` = 0 lets FFmpeg choose.
-DecodedVideo decode_video_frames(const std::string& path, const std::vector<int64_t>& indices,
-                                 int threads = 0);
+// converts them to RGB24 with swscale (SWS_BICUBIC, as decord's filter graph).
+// `threads` <= 0 uses 8 decoder threads. `info` skips re-probing the file.
+DecodedVideo decode_video_frames(const std::string& path, const std::vector<int64_t>& indices, int threads = 0,
+                                 const VideoInfo* info = nullptr);
 
 }  // namespace wemm

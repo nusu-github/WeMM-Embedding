@@ -24,12 +24,15 @@ struct SafeTensors::Mapping {
     int fd = ::open(path.c_str(), O_RDONLY);
     WEMM_CHECK(fd >= 0, "cannot open ", path);
     struct stat st{};
-    ::fstat(fd, &st);
+    const int rc = ::fstat(fd, &st);
+    if (rc != 0 || st.st_size <= 0) {
+      ::close(fd);
+      throw Error("cannot stat (or empty) " + path);
+    }
     size = static_cast<size_t>(st.st_size);
     data = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
     ::close(fd);
     WEMM_CHECK(data != MAP_FAILED, "mmap failed for ", path);
-    ::madvise(data, size, MADV_SEQUENTIAL);
   }
   ~Mapping() {
     if (data && data != MAP_FAILED) ::munmap(data, size);
@@ -68,7 +71,14 @@ void SafeTensors::add_file(const std::string& file) {
     auto off = info.at("data_offsets").get<std::vector<size_t>>();
     e.begin = base + off.at(0);
     e.end = base + off.at(1);
-    WEMM_CHECK(e.end <= map->size, "tensor ", name, " out of bounds in ", file);
+    WEMM_CHECK(e.begin <= e.end && e.end <= map->size, "tensor ", name, " out of bounds in ", file);
+    int64_t numel = 1;
+    for (int64_t d : e.shape) {
+      WEMM_CHECK(d >= 0, "negative dimension in ", name);
+      numel *= d;
+    }
+    WEMM_CHECK(size_t(numel) * c10::elementSize(e.dtype) == e.end - e.begin, "tensor ", name,
+               " byte size does not match its shape in ", file);
     index_[name] = std::move(e);
   }
 }

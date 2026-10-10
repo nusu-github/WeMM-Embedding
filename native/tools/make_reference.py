@@ -44,6 +44,8 @@ def cases(data):
         "gray": [{"type": "image", "image": d("gray.jpg")}],
         "exif": [{"type": "image", "image": d("exif6.jpg")}],
         "palette": [{"type": "image", "image": d("palette.png")}],
+        "rgb16": [{"type": "image", "image": d("rgb16.png")}],
+        "gray16": [{"type": "image", "image": d("gray16.png")}],
         "multi_image": [{"type": "text", "text": "Compare: "}, {"type": "image", "image": d("hero.jpg")},
                         {"type": "image", "image": d("small.png")}, {"type": "text", "text": " which is brighter?"}],
         "image_pixels": [{"type": "image", "image": d("chart.webp"), "min_pixels": 50000, "max_pixels": 200000}],

@@ -53,8 +53,24 @@ int main(int argc, char** argv) {
   const int64_t C = int64_t(cs.size());
 
   auto ch = wemm::kernels::gdn_chunk_prepare(mixed, b, a, neg_A, dt_bias, chunk_start, chunk_valid, H, H, dk, dv);
-  at::Tensor o = wemm::kernels::gdn_chunk_recurrence(ch.qg, ch.kd, ch.u, ch.w, ch.aqk, ch.dl, chunk_off,
-                                                     int64_t(lens.size()));
+  at::Tensor o = wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, int64_t(lens.size()));
+  at::Tensor o_single = wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, int64_t(lens.size()), 0, at::Tensor(), false);
+  std::printf("single-buffer vs double-buffer max diff: %.3e\n", (o - o_single).abs().max().item<double>());
+  // windowed (3 chunks per window, state carried across windows)
+  {
+    const int64_t C = chunk_start.numel(), W = 3;
+    at::Tensor carry = at::empty({H, int64_t(lens.size()), dk, dv}, mixed.options().dtype(at::kFloat));
+    double md = 0;
+    at::Tensor oc = o.view({H, C, 64, dv});
+    for (int64_t c0 = 0; c0 < C; c0 += W) {
+      const int64_t c1 = std::min(C, c0 + W);
+      auto cw = wemm::kernels::gdn_chunk_prepare(mixed, b, a, neg_A, dt_bias, chunk_start, chunk_valid, H, H, dk, dv,
+                                                 c0, c1);
+      at::Tensor ow = wemm::kernels::gdn_chunk_recurrence(cw, chunk_off, int64_t(lens.size()), c0, carry);
+      md = std::max(md, (ow - oc.narrow(1, c0, c1 - c0)).abs().max().item<double>());
+    }
+    std::printf("windowed vs full max diff: %.3e\n", md);
+  }
 
   // ---- reference: token-by-token recurrence in fp64 (exact semantics).
   {
@@ -87,8 +103,8 @@ int main(int argc, char** argv) {
   double tp = time_ms([&] {
     wemm::kernels::gdn_chunk_prepare(mixed, b, a, neg_A, dt_bias, chunk_start, chunk_valid, H, H, dk, dv);
   });
-  double tr = time_ms([&] {
-    wemm::kernels::gdn_chunk_recurrence(ch.qg, ch.kd, ch.u, ch.w, ch.aqk, ch.dl, chunk_off, int64_t(lens.size()));
-  });
-  std::printf("prepare %.3f ms   recurrence %.3f ms\n", tp, tr);
+  double tr = time_ms([&] { wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, int64_t(lens.size())); });
+  double ts = time_ms(
+      [&] { wemm::kernels::gdn_chunk_recurrence(ch, chunk_off, int64_t(lens.size()), 0, at::Tensor(), false); });
+  std::printf("prepare %.3f ms   recurrence %.3f ms (single-buffer %.3f ms)\n", tp, tr, ts);
 }

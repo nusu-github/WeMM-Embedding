@@ -60,12 +60,10 @@ struct ProcessorConfig {
   // image processor
   int64_t image_min_pixels = 65536;
   int64_t image_max_pixels = 16777216;
-  // video processor
+  // video processor (frame sampling is done by qwen-vl-utils' rules, the
+  // Transformers video processor runs with do_sample_frames=False)
   int64_t video_min_pixels = 4096;
   int64_t video_max_pixels = 234881024;
-  double video_fps = 2.0;
-  int video_min_frames = 4;
-  int video_max_frames = 768;
   std::array<float, 3> image_mean{0.5f, 0.5f, 0.5f};
   std::array<float, 3> image_std{0.5f, 0.5f, 0.5f};
   double rescale_factor = 1.0 / 255.0;

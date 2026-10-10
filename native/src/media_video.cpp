@@ -50,10 +50,6 @@ std::string av_err(int code) {
   return buf;
 }
 
-std::string strip_file_scheme(const std::string& path) {
-  return path.rfind("file://", 0) == 0 ? path.substr(7) : path;
-}
-
 int open_stream(FormatCtx& fmt, const std::string& path) {
   int rc = avformat_open_input(&fmt.ctx, strip_file_scheme(path).c_str(), nullptr, nullptr);
   WEMM_CHECK(rc >= 0, "cannot open video ", path, ": ", av_err(rc));
@@ -70,12 +66,9 @@ double stream_fps(const AVStream* st) {
   return 0.0;
 }
 
-// swscale flags used for YUV->RGB24. Defaults to libavfilter's `scale` default
-// (bicubic), which is what decord's filter graph uses.
-int sws_flags() {
-  if (const char* env = std::getenv("WEMM_SWS_FLAGS")) return std::atoi(env);
-  return SWS_BICUBIC;
-}
+// swscale flags for YUV->RGB24: libavfilter's `scale` default (bicubic), which
+// is what decord's filter graph uses. Verified bit-exact against decord.
+constexpr int kSwsFlags = SWS_BICUBIC;
 
 }  // namespace
 
@@ -98,11 +91,12 @@ VideoInfo probe_video(const std::string& path) {
   return info;
 }
 
-DecodedVideo decode_video_frames(const std::string& path, const std::vector<int64_t>& indices, int threads) {
+DecodedVideo decode_video_frames(const std::string& path, const std::vector<int64_t>& indices, int threads,
+                                 const VideoInfo* info) {
   WEMM_CHECK(!indices.empty(), "no frames requested");
   WEMM_CHECK(std::is_sorted(indices.begin(), indices.end()), "frame indices must be sorted");
   DecodedVideo out;
-  out.info = probe_video(path);
+  out.info = info ? *info : probe_video(path);
   out.frame_indices = indices;
 
   FormatCtx fmt;
@@ -115,16 +109,14 @@ DecodedVideo decode_video_frames(const std::string& path, const std::vector<int6
   WEMM_CHECK(codec, "no decoder for ", path);
   CodecCtx dec;
   dec.ctx = avcodec_alloc_context3(codec);
-  avcodec_parameters_to_context(dec.ctx, st->codecpar);
-  if (threads <= 0) {
-    // FFmpeg's auto mode spawns one thread per core; beyond ~8 frame threads
-    // decoding gets slower again.
-    threads = 8;
-    if (const char* env = std::getenv("WEMM_DECODE_THREADS")) threads = std::atoi(env);
-  }
+  int rc = avcodec_parameters_to_context(dec.ctx, st->codecpar);
+  WEMM_CHECK(rc >= 0, "cannot configure decoder: ", av_err(rc));
+  // FFmpeg's auto mode spawns one thread per core; beyond ~8 frame threads
+  // decoding gets slower again.
+  if (threads <= 0) threads = 8;
   dec.ctx->thread_count = threads;
   dec.ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-  int rc = avcodec_open2(dec.ctx, codec, nullptr);
+  rc = avcodec_open2(dec.ctx, codec, nullptr);
   WEMM_CHECK(rc >= 0, "cannot open decoder: ", av_err(rc));
 
   const int W = st->codecpar->width, H = st->codecpar->height;
@@ -148,7 +140,7 @@ DecodedVideo decode_video_frames(const std::string& path, const std::vector<int6
     while (want < indices.size() && indices[want] == frame_no) {
       WEMM_CHECK(f->width == W && f->height == H, "variable frame size is not supported");
       sws.ctx = sws_getCachedContext(sws.ctx, f->width, f->height, AVPixelFormat(f->format), W, H,
-                                     AV_PIX_FMT_RGB24, sws_flags(), nullptr, nullptr, nullptr);
+                                     AV_PIX_FMT_RGB24, kSwsFlags, nullptr, nullptr, nullptr);
       WEMM_CHECK(sws.ctx, "cannot create swscale context");
       uint8_t* dst = dst_base + int64_t(want) * frame_bytes;
       if (want > 0 && indices[want - 1] == frame_no) {

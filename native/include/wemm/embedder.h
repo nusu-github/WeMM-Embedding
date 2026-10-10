@@ -15,7 +15,9 @@ namespace wemm {
 struct EmbedderOptions {
   ModelOptions model;
   int preprocess_threads = 0;        // 0 = auto
-  int intra_op_threads = 16;         // ATen CPU threads (resizing); <= 0 keeps the default
+  // ATen CPU threads used by the image/video resizes (past ~16 they get
+  // slower). NOTE: at::set_num_threads is process-wide; <= 0 leaves it alone.
+  int intra_op_threads = 16;
   int64_t max_batch_tokens = 32768;  // packed tokens per forward pass
   int64_t max_batch_size = 64;
 };

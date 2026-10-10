@@ -9,7 +9,6 @@ void wemm_tok_free_str(char* s);
 int wemm_tok_encode_batch(const void* tok, const char* const* texts, const size_t* lens, size_t n,
                           bool add_special_tokens, uint32_t** out_ids, size_t* out_lens, char** err);
 void wemm_tok_free_ids(uint32_t* ids, size_t len);
-int64_t wemm_tok_token_to_id(const void* tok, const char* token);
 }
 
 namespace wemm {
@@ -54,10 +53,6 @@ std::vector<std::vector<int32_t>> Tokenizer::encode_batch(const std::vector<std:
 
 std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_special_tokens) const {
   return encode_batch({text}, add_special_tokens)[0];
-}
-
-int64_t Tokenizer::token_to_id(const std::string& token) const {
-  return wemm_tok_token_to_id(handle_, token.c_str());
 }
 
 }  // namespace wemm

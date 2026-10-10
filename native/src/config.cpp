@@ -110,9 +110,6 @@ ProcessorConfig ProcessorConfig::load(const std::string& model_dir) {
       maybe(vp.at("size"), "shortest_edge", c.video_min_pixels);
       maybe(vp.at("size"), "longest_edge", c.video_max_pixels);
     }
-    maybe(vp, "fps", c.video_fps);
-    maybe(vp, "min_frames", c.video_min_frames);
-    maybe(vp, "max_frames", c.video_max_frames);
   }
   return c;
 }
