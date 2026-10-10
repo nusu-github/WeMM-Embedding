@@ -7,10 +7,13 @@ set(CMAKE_CUDA_STANDARD 17)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  # Ampere through Blackwell (CUDA 13 dropped pre-Turing).
-  set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90 100 120)
+# Kernels use bf16 math and cp.async: Ampere (sm_80) or newer. LibTorch's CMake
+# drives -gencode from TORCH_CUDA_ARCH_LIST, so set that (override with
+# -DTORCH_CUDA_ARCH_LIST="8.6" to build for one GPU only).
+if(NOT DEFINED TORCH_CUDA_ARCH_LIST)
+  set(TORCH_CUDA_ARCH_LIST "8.0;8.6;8.9;9.0;10.0;12.0+PTX")
 endif()
+set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
 
 # LibTorch: point CMAKE_PREFIX_PATH (or Torch_DIR) at an unpacked libtorch
 # (cu130 build) or at `python -c 'import torch; print(torch.utils.cmake_prefix_path)'`.
@@ -45,6 +48,7 @@ add_library(wemm SHARED
   src/processor.cpp
   src/pixels.cpp
   src/model.cpp
+  src/gemm.cpp
   src/embedder.cpp
   src/kernels/gdn.cu
   src/kernels/fused.cu
@@ -66,3 +70,9 @@ target_link_libraries(wemm_bench PRIVATE wemm)
 
 add_executable(wemm_test_reference tests/test_reference.cpp)
 target_link_libraries(wemm_test_reference PRIVATE wemm nlohmann_json::nlohmann_json)
+
+add_executable(wemm_bench_gemm tests/bench_gemm.cpp)
+target_link_libraries(wemm_bench_gemm PRIVATE wemm)
+
+add_executable(wemm_bench_gdn tests/bench_gdn.cpp)
+target_link_libraries(wemm_bench_gdn PRIVATE wemm)

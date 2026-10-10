@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <chrono>
 #include <thread>
 
 #include "wemm/common.h"
@@ -317,7 +318,10 @@ Visual Processor::load_video(const ContentItem& item) const {
                             : double(start_frame) + double(end_frame - start_frame) * double(i) / double(nframes - 1);
     idx[size_t(i)] = int64_t(py_round(v));
   }
+  static const bool timing = std::getenv("WEMM_TIMING") != nullptr;
+  auto t0 = std::chrono::steady_clock::now();
   DecodedVideo dec = decode_video_frames(item.source, idx);
+  auto t1 = std::chrono::steady_clock::now();
 
   // fetch_video resizing
   const int64_t factor = int64_t(pcfg_.patch_size) * pcfg_.merge_size;
@@ -335,6 +339,13 @@ Visual Processor::load_video(const ContentItem& item) const {
   else
     hw = qwen_smart_resize(H, W, factor, min_pixels, max_pixels);
   at::Tensor frames = torch_resize_uint8_via_float(dec.frames, hw.first, hw.second);
+  if (timing) {
+    auto t2 = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[wemm] video %s: decode %.1f ms (%zu frames), resize %lldx%lld->%lldx%lld %.1f ms\n",
+                 item.source.c_str(), std::chrono::duration<double, std::milli>(t1 - t0).count(), idx.size(),
+                 (long long)H, (long long)W, (long long)hw.first, (long long)hw.second,
+                 std::chrono::duration<double, std::milli>(t2 - t1).count());
+  }
 
   // Qwen3VLVideoProcessor: second smart_resize, float bicubic if the size changes.
   auto hw2 = hf_video_smart_resize(nframes, hw.first, hw.second, pcfg_.temporal_patch_size, factor,

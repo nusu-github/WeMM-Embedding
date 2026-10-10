@@ -15,6 +15,7 @@ namespace wemm {
 struct EmbedderOptions {
   ModelOptions model;
   int preprocess_threads = 0;        // 0 = auto
+  int intra_op_threads = 16;         // ATen CPU threads (resizing); <= 0 keeps the default
   int64_t max_batch_tokens = 32768;  // packed tokens per forward pass
   int64_t max_batch_size = 64;
 };

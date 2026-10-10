@@ -1,5 +1,6 @@
 #include "wemm/embedder.h"
 
+#include <ATen/Parallel.h>
 #include <c10/core/InferenceMode.h>
 
 #include <algorithm>
@@ -11,6 +12,8 @@
 namespace wemm {
 
 Embedder::Embedder(const std::string& model_dir, EmbedderOptions opts) : opts_(opts) {
+  // The ATen CPU resize kernels scale poorly past ~16 threads on small images.
+  if (opts.intra_op_threads > 0) at::set_num_threads(opts.intra_op_threads);
   processor_ = std::make_unique<Processor>(model_dir);
   model_ = std::make_unique<WeMMModel>(model_dir, opts.model);
 }

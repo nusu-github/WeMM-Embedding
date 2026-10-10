@@ -24,6 +24,7 @@ int main(int argc, char** argv) {
     else if (a == "--iters") iters = std::stoi(argv[++i]);
     else if (a == "--batch") batch = std::stoi(argv[++i]);
     else if (a == "--unfused") opts.model.fused_kernels = false;
+    else if (a == "--bf16-residual") opts.model.fp32_residual = false;
     else if (a == "--text") inputs.push_back(text_conversation(argv[++i]));
     else if (a == "--image") inputs.push_back(image_conversation(argv[++i]));
     else if (a == "--video") inputs.push_back(video_conversation(argv[++i]));

@@ -4,10 +4,13 @@
 #include <c10/core/InferenceMode.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <nvtx3/nvToolsExt.h>
+
 #include <cmath>
 #include <numeric>
 
 #include "wemm/common.h"
+#include "wemm/gemm.h"
 #include "wemm/kernels.h"
 #include "wemm/pixels.h"
 #include "wemm/safetensors.h"
@@ -17,6 +20,11 @@ namespace wemm {
 namespace {
 
 constexpr int64_t kChunk = 64;
+
+struct NvtxRange {
+  explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
+  ~NvtxRange() { nvtxRangePop(); }
+};
 
 at::Tensor rmsnorm(const at::Tensor& x, const at::Tensor& w1p, double eps, at::ScalarType out = at::kBFloat16) {
   at::Tensor xf = x.to(at::kFloat);
@@ -61,6 +69,7 @@ WeMMModel::WeMMModel(const std::string& model_dir, ModelOptions opts)
   const std::string vp = "model.visual.";
   patch_w = bf16(vp + "patch_embed.proj.weight").reshape({vc.hidden_size, -1}).contiguous();
   patch_b = bf16(vp + "patch_embed.proj.bias");
+  patch_b32 = patch_b.to(at::kFloat);
   pos_embed = bf16(vp + "pos_embed.weight");
   for (int i = 0; i < vc.depth; ++i) {
     const std::string p = vp + "blocks." + std::to_string(i) + ".";
@@ -77,10 +86,18 @@ WeMMModel::WeMMModel(const std::string& model_dir, ModelOptions opts)
     b.fc1_b = bf16(p + "mlp.linear_fc1.bias");
     b.fc2_w = bf16(p + "mlp.linear_fc2.weight");
     b.fc2_b = bf16(p + "mlp.linear_fc2.bias");
+    b.proj_b32 = b.proj_b.to(at::kFloat);
+    b.fc2_b32 = b.fc2_b.to(at::kFloat);
+    b.n1w = b.norm1_w.to(at::kFloat);
+    b.n1b = b.norm1_b.to(at::kFloat);
+    b.n2w = b.norm2_w.to(at::kFloat);
+    b.n2b = b.norm2_b.to(at::kFloat);
     vblocks_.push_back(std::move(b));
   }
   merger_norm_w = bf16(vp + "merger.norm.weight");
   merger_norm_b = bf16(vp + "merger.norm.bias");
+  merger_nw = merger_norm_w.to(at::kFloat);
+  merger_nb = merger_norm_b.to(at::kFloat);
   merger_fc1_w = bf16(vp + "merger.linear_fc1.weight");
   merger_fc1_b = bf16(vp + "merger.linear_fc1.bias");
   merger_fc2_w = bf16(vp + "merger.linear_fc2.weight");
@@ -104,7 +121,10 @@ WeMMModel::WeMMModel(const std::string& model_dir, ModelOptions opts)
       const std::string a = p + "linear_attn.";
       l.in_proj = at::cat({bf16(a + "in_proj_qkv.weight"), bf16(a + "in_proj_z.weight"), bf16(a + "in_proj_b.weight"),
                            bf16(a + "in_proj_a.weight")},
-                          0)
+                          0);
+      // Pad the fused projection to a multiple of 128 outputs (faster GEMM tiles).
+      const int64_t rows = l.in_proj.size(0), padded = (rows + 127) / 128 * 128;
+      l.in_proj = at::cat({l.in_proj, at::zeros({padded - rows, l.in_proj.size(1)}, l.in_proj.options())}, 0)
                       .contiguous();
       l.conv_w = f32(a + "conv1d.weight").squeeze(1).contiguous();
       l.neg_A = -f32(a + "A_log").exp();
@@ -134,6 +154,7 @@ WeMMModel::WeMMModel(const std::string& model_dir, ModelOptions opts)
 
 // ================================================================ vision =====
 at::Tensor WeMMModel::vision_forward(const at::Tensor& pixel_values, const std::vector<std::array<int64_t, 3>>& grids) {
+  NvtxRange range("vision");
   const auto& vc = cfg_.vision;
   const int64_t m = vc.spatial_merge_size, D = vc.hidden_size, nh = vc.num_heads, hd = D / nh;
   const int64_t side = int64_t(std::lround(std::sqrt(double(vc.num_position_embeddings))));
@@ -177,21 +198,23 @@ at::Tensor WeMMModel::vision_forward(const at::Tensor& pixel_values, const std::
   const int64_t P = int64_t(rows.size());
   WEMM_CHECK(P == pixel_values.size(0), "pixel_values rows do not match grids");
 
-  at::Tensor x = at::linear(pixel_values.to(at::kBFloat16), patch_w, patch_b);  // Conv3d == linear
-  at::Tensor pe = at::zeros({P, D}, x.options().dtype(at::kFloat));
+  at::Tensor pe = at::zeros({P, D}, pos_embed.options().dtype(at::kFloat));
   for (int i = 0; i < 4; ++i) {
     at::Tensor ii = to_device_i64(idx[i], device_);
     at::Tensor ww = at::tensor(at::ArrayRef<float>(wts[i])).to(device_);
     pe += pos_embed.index_select(0, ii).to(at::kFloat) * ww.unsqueeze(1);
   }
-  x = (x.to(at::kFloat) + pe).to(at::kBFloat16);
 
   at::Tensor rf = at::tensor(at::ArrayRef<float>(rows)).to(device_);
   at::Tensor cf = at::tensor(at::ArrayRef<float>(cols)).to(device_);
   at::Tensor emb = at::cat({rf.unsqueeze(1) * vision_inv_freq, cf.unsqueeze(1) * vision_inv_freq}, 1);
   emb = at::cat({emb, emb}, 1);  // [P, hd]
-  at::Tensor cos = emb.cos().unsqueeze(1), sin = emb.sin().unsqueeze(1);
   at::Tensor cu_t = to_device_i32(cu, device_);
+  if (opts_.fused_kernels) return vision_forward_fused(pixel_values, pe, emb.cos(), emb.sin(), cu_t, max_len);
+
+  at::Tensor x = at::linear(pixel_values.to(at::kBFloat16), patch_w, patch_b);  // Conv3d == linear
+  x = (x.to(at::kFloat) + pe).to(at::kBFloat16);
+  at::Tensor cos = emb.cos().unsqueeze(1), sin = emb.sin().unsqueeze(1);
   const double scale = 1.0 / std::sqrt(double(hd));
 
   for (const auto& b : vblocks_) {
@@ -210,10 +233,126 @@ at::Tensor WeMMModel::vision_forward(const at::Tensor& pixel_values, const std::
   return at::linear(at::gelu(at::linear(y, merger_fc1_w, merger_fc1_b)), merger_fc2_w, merger_fc2_b);
 }
 
+at::Tensor WeMMModel::vision_forward_fused(const at::Tensor& pixel_values, const at::Tensor& pe, const at::Tensor& cos,
+                                           const at::Tensor& sin, const at::Tensor& cu, int64_t max_len) {
+  const auto& vc = cfg_.vision;
+  const int64_t m = vc.spatial_merge_size, D = vc.hidden_size, nh = vc.num_heads, hd = D / nh;
+  const int64_t P = pixel_values.size(0);
+  const double scale = 1.0 / std::sqrt(double(hd));
+  const auto rdt = opts_.fp32_residual ? at::kFloat : at::kBFloat16;
+  // Conv3d == linear; the position embedding is added in fp32.
+  at::Tensor x = (gemm(pixel_values.to(at::kBFloat16).contiguous(), patch_w, patch_b32, std::nullopt, Epilogue::None,
+                       at::kFloat) + pe).to(rdt);
+  const bool f32 = opts_.fp32_residual;
+  for (const auto& b : vblocks_) {
+    at::Tensor y = kernels::layernorm(x, b.n1w, b.n1b, 1e-6);
+    at::Tensor qkv = gemm(y, b.qkv_w, b.qkv_b);
+    auto [q, k] = kernels::vision_qk_rope(qkv, cos, sin, nh);
+    at::Tensor v = qkv.view({P, 3, nh, hd}).select(1, 2);
+    at::Tensor o = flash_varlen(q, k, v, cu, cu, max_len, max_len, false, scale);
+    x = gemm(o.view({P, D}), b.proj_w, f32 ? b.proj_b32 : b.proj_b, x);
+    y = kernels::layernorm(x, b.n2w, b.n2b, 1e-6);
+    x = gemm(gemm(y, b.fc1_w, b.fc1_b, std::nullopt, Epilogue::Gelu), b.fc2_w, f32 ? b.fc2_b32 : b.fc2_b, x);
+  }
+  at::Tensor y = kernels::layernorm(x, merger_nw, merger_nb, 1e-6).view({P / (m * m), D * m * m});
+  return gemm(at::gelu(gemm(y, merger_fc1_w, merger_fc1_b)), merger_fc2_w, merger_fc2_b);
+}
+
 // ================================================================ text =======
+WeMMModel::Packing WeMMModel::make_packing(const std::vector<int64_t>& seq_lens) const {
+  Packing pk;
+  pk.seq_lens = seq_lens;
+  std::vector<int32_t> cu{0}, seq_start, chunk_start, chunk_valid, chunk_off{0}, padded_row;
+  std::vector<int64_t> last;
+  for (int64_t len : seq_lens) {
+    const int32_t base_tok = cu.back();
+    const int32_t base_row = int32_t(chunk_start.size()) * int32_t(kChunk);
+    for (int64_t j = 0; j < len; ++j) {
+      seq_start.push_back(base_tok);
+      padded_row.push_back(base_row + int32_t(j));
+    }
+    const int64_t nch = (len + kChunk - 1) / kChunk;
+    for (int64_t c = 0; c < nch; ++c) {
+      chunk_start.push_back(base_tok + int32_t(c * kChunk));
+      chunk_valid.push_back(int32_t(std::min<int64_t>(kChunk, len - c * kChunk)));
+    }
+    chunk_off.push_back(chunk_off.back() + int32_t(nch));
+    cu.push_back(base_tok + int32_t(len));
+    last.push_back(cu.back() - 1);
+    pk.max_len = std::max(pk.max_len, len);
+  }
+  pk.cu_seqlens = to_device_i32(cu, device_);
+  pk.seq_start = to_device_i32(seq_start, device_);
+  pk.last_rows = to_device_i64(last, device_);
+  pk.chunk_start = to_device_i32(chunk_start, device_);
+  pk.chunk_valid = to_device_i32(chunk_valid, device_);
+  pk.chunk_off = to_device_i32(chunk_off, device_);
+  pk.padded_row = to_device_i32(padded_row, device_);
+  return pk;
+}
+
+at::Tensor WeMMModel::linear_attention_fused(const TextLayer& l, const at::Tensor& x, const at::Tensor& h,
+                                             const Packing& pk, bool last) {
+  NvtxRange range("linear_attn");
+  const auto& tc = cfg_.text;
+  const int64_t Hk = tc.linear_num_key_heads, Hv = tc.linear_num_value_heads;
+  const int64_t dk = tc.linear_key_head_dim, dv = tc.linear_value_head_dim;
+  const int64_t key_dim = Hk * dk, value_dim = Hv * dv, conv_dim = 2 * key_dim + value_dim;
+  const int64_t N = int64_t(pk.seq_lens.size());
+
+  at::Tensor proj = gemm(x, l.in_proj);
+  at::Tensor mixed = kernels::causal_conv1d_silu(proj.narrow(1, 0, conv_dim), l.conv_w, pk.seq_start);
+  at::Tensor z = proj.narrow(1, conv_dim, value_dim);
+  at::Tensor b = proj.narrow(1, conv_dim + value_dim, Hv);
+  at::Tensor a = proj.narrow(1, conv_dim + value_dim + Hv, Hv);
+  at::Tensor o;
+  {
+    NvtxRange r2("gdn");
+    auto ch = kernels::gdn_chunk_prepare(mixed, b, a, l.neg_A, l.dt_bias, pk.chunk_start, pk.chunk_valid, Hk, Hv,
+                                         dk, dv);
+    o = kernels::gdn_chunk_recurrence(ch.qg, ch.kd, ch.u, ch.w, ch.aqk, ch.dl, pk.chunk_off, N);
+  }
+  const int64_t C = o.size(1);
+  if (last) {
+    at::Tensor rows = pk.padded_row.index_select(0, pk.last_rows);
+    at::Tensor on = kernels::gdn_gated_rmsnorm(o.view({Hv, C * kChunk, dv}), rows, z.index_select(0, pk.last_rows),
+                                               l.gnorm_w, tc.rms_norm_eps);
+    return gemm(on, l.out_proj, std::nullopt, h.index_select(0, pk.last_rows));
+  }
+  at::Tensor on = kernels::gdn_gated_rmsnorm(o.view({Hv, C * kChunk, dv}), pk.padded_row, z, l.gnorm_w, tc.rms_norm_eps);
+  return gemm(on, l.out_proj, std::nullopt, h);
+}
+
+at::Tensor WeMMModel::full_attention_fused(const TextLayer& l, const at::Tensor& x, const at::Tensor& h,
+                                           const at::Tensor& cos, const at::Tensor& sin, const Packing& pk, bool last) {
+  NvtxRange range("full_attn");
+  const auto& tc = cfg_.text;
+  const int64_t L = x.size(0), H = tc.num_attention_heads, Hkv = tc.num_key_value_heads, hd = tc.head_dim;
+  at::Tensor proj = gemm(x, l.qkv_proj);
+  at::Tensor qg = proj.narrow(1, 0, H * hd * 2).view({L, H, 2 * hd});
+  at::Tensor qv = qg.narrow(2, 0, hd), gate = qg.narrow(2, hd, hd);
+  at::Tensor kv = proj.narrow(1, H * hd * 2, Hkv * hd).view({L, Hkv, hd});
+  at::Tensor v = proj.narrow(1, H * hd * 2 + Hkv * hd, Hkv * hd).view({L, Hkv, hd});
+  at::Tensor rows = last ? pk.last_rows : at::Tensor();
+  at::Tensor q = kernels::head_rmsnorm_rope(qv, l.q_norm, cos, sin, rows, tc.rms_norm_eps);
+  at::Tensor k = kernels::head_rmsnorm_rope(kv, l.k_norm, cos, sin, at::Tensor(), tc.rms_norm_eps);
+  const double scale = 1.0 / std::sqrt(double(hd));
+  at::Tensor o;
+  if (last) {
+    const int64_t N = q.size(0);
+    at::Tensor cu_q = at::arange(0, N + 1, at::TensorOptions().dtype(at::kInt).device(device_));
+    o = flash_varlen(q, k, v, cu_q, pk.cu_seqlens, 1, pk.max_len, /*causal=*/false, scale);
+  } else {
+    o = flash_varlen(q, k, v, pk.cu_seqlens, pk.cu_seqlens, pk.max_len, pk.max_len, /*causal=*/true, scale);
+  }
+  at::Tensor og = kernels::sigmoid_gate_mul(o, gate, rows);
+  return gemm(og, l.o_proj, std::nullopt, last ? h.index_select(0, pk.last_rows) : h);
+}
+
 at::Tensor WeMMModel::gated_delta_rule(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                                        const at::Tensor& g, const at::Tensor& beta,
                                        const std::vector<int64_t>& seq_lens) {
+  NvtxRange range("gdn");
   const int64_t L = q.size(0), H = q.size(1), dk = q.size(2), dv = v.size(2);
   // Chunk-padded layout: every sequence starts on a chunk boundary.
   std::vector<int64_t> gather, scatter(static_cast<size_t>(L));
@@ -373,6 +512,7 @@ at::Tensor WeMMModel::full_attention(const TextLayer& l, const at::Tensor& x, co
 }
 
 at::Tensor WeMMModel::mlp(const TextLayer& l, const at::Tensor& x) {
+  NvtxRange range("mlp");
   at::Tensor gu = at::linear(x, l.gate_up);
   const int64_t I = gu.size(1) / 2;
   at::Tensor act = (at::silu(gu.narrow(1, 0, I).to(at::kFloat)) * gu.narrow(1, I, I).to(at::kFloat)).to(at::kBFloat16);
@@ -380,6 +520,7 @@ at::Tensor WeMMModel::mlp(const TextLayer& l, const at::Tensor& x) {
 }
 
 at::Tensor WeMMModel::text_forward(at::Tensor h, const at::Tensor& position_ids, const std::vector<int64_t>& seq_lens) {
+  NvtxRange range("text");
   const auto& tc = cfg_.text;
   const int64_t L = h.size(0), N = int64_t(seq_lens.size());
   std::vector<int32_t> cu{0}, seq_start;
@@ -409,11 +550,27 @@ at::Tensor WeMMModel::text_forward(at::Tensor h, const at::Tensor& position_ids,
   at::Tensor emb = at::cat({freqs, freqs}, -1);
   at::Tensor cos = emb.cos(), sin = emb.sin();
 
+  if (opts_.fused_kernels) {
+    Packing pk = make_packing(seq_lens);
+    if (opts_.fp32_residual) h = h.to(at::kFloat);
+    for (size_t i = 0; i < layers_.size(); ++i) {
+      const auto& l = layers_[i];
+      const bool is_last = i + 1 == layers_.size();
+      at::Tensor x = kernels::rmsnorm(h, l.in_norm, tc.rms_norm_eps);
+      h = l.linear ? linear_attention_fused(l, x, h, pk, is_last) : full_attention_fused(l, x, h, cos, sin, pk, is_last);
+      NvtxRange r("mlp");
+      at::Tensor gu = gemm(kernels::rmsnorm(h, l.post_norm, tc.rms_norm_eps), l.gate_up);
+      h = gemm(kernels::silu_mul(gu), l.down, std::nullopt, h);
+    }
+    WEMM_CHECK(h.size(0) == N, "unexpected output rows");
+    return kernels::rmsnorm(h, final_norm, tc.rms_norm_eps, at::kFloat);
+  }
   for (size_t i = 0; i < layers_.size(); ++i) {
     const auto& l = layers_[i];
     const bool is_last = i + 1 == layers_.size();
     at::Tensor x = rmsnorm(h, l.in_norm, tc.rms_norm_eps);
     at::Tensor mix;
+    NvtxRange lr(l.linear ? "linear_attn" : "full_attn");
     if (l.linear) {
       mix = linear_attention(l, x, seq_start_t, seq_lens);
       if (is_last) mix = mix.index_select(0, last_t);

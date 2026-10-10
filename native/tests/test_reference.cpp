@@ -28,8 +28,12 @@ int main(int argc, char** argv) {
   }
   const std::string model_dir = argv[1], ref_dir = argv[2];
   EmbedderOptions opts;
-  for (int i = 3; i < argc; ++i)
+  std::string only;
+  for (int i = 3; i < argc; ++i) {
     if (std::string(argv[i]) == "--unfused") opts.model.fused_kernels = false;
+    if (std::string(argv[i]) == "--bf16-residual") opts.model.fp32_residual = false;
+    if (std::string(argv[i]) == "--only" && i + 1 < argc) only = "," + std::string(argv[++i]) + ",";
+  }
 
   c10::InferenceMode guard;
   std::ifstream in(ref_dir + "/manifest.json");
@@ -42,6 +46,7 @@ int main(int argc, char** argv) {
   std::vector<ProcessedSample> samples;
   std::vector<at::Tensor> ref_bf16, ref_fp32;
   for (auto& [name, entry] : manifest.items()) {
+    if (!only.empty() && only.find("," + name + ",") == std::string::npos) continue;
     nlohmann::json msg = {{{"role", "user"}, {"content", entry.at("content")}}};
     Conversation conv = conversation_from_json(msg);
     ProcessedSample s = proc.process(conv);
@@ -90,8 +95,8 @@ int main(int argc, char** argv) {
   }
 
   // One sample per forward, then everything packed into a single batch.
-  std::printf("\n%-12s %14s %14s %14s %14s\n", "case", "cos(nat,hf16)", "cos(nat,hf32)", "cos(hf16,hf32)",
-              "cos(batch,single)");
+  std::printf("\n%-12s %14s %14s %14s %14s %14s\n", "case", "cos(nat,hf16)", "cos(nat,hf32)", "cos(hf16,hf32)",
+              "cos(batch,single)", "cos(batch,hf32)");
   at::Tensor batched = emb.model().embed(samples).cpu();
   for (size_t i = 0; i < samples.size(); ++i) {
     at::Tensor single = emb.model().embed({samples[i]}).cpu().flatten();
@@ -99,7 +104,8 @@ int main(int argc, char** argv) {
     double b = ref_fp32[i].defined() ? cos_sim(single, ref_fp32[i]) : NAN;
     double c = ref_fp32[i].defined() ? cos_sim(ref_bf16[i], ref_fp32[i]) : NAN;
     double d = cos_sim(single, batched[int64_t(i)]);
-    std::printf("%-12s %14.6f %14.6f %14.6f %14.6f\n", names[i].c_str(), a, b, c, d);
+    double e = ref_fp32[i].defined() ? cos_sim(batched[int64_t(i)], ref_fp32[i]) : NAN;
+    std::printf("%-12s %14.6f %14.6f %14.6f %14.6f %14.6f\n", names[i].c_str(), a, b, c, d, e);
     if (a < 0.995) ++failures;
   }
   std::printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);

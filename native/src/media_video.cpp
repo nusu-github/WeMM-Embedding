@@ -116,6 +116,12 @@ DecodedVideo decode_video_frames(const std::string& path, const std::vector<int6
   CodecCtx dec;
   dec.ctx = avcodec_alloc_context3(codec);
   avcodec_parameters_to_context(dec.ctx, st->codecpar);
+  if (threads <= 0) {
+    // FFmpeg's auto mode spawns one thread per core; beyond ~8 frame threads
+    // decoding gets slower again.
+    threads = 8;
+    if (const char* env = std::getenv("WEMM_DECODE_THREADS")) threads = std::atoi(env);
+  }
   dec.ctx->thread_count = threads;
   dec.ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
   int rc = avcodec_open2(dec.ctx, codec, nullptr);
