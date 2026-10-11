@@ -60,3 +60,7 @@ htmlcov/
 
 # Wheels
 *.whl
+native/build/
+native/tokenizers-ffi/target/
+native/tools/__pycache__/
+__pycache__/

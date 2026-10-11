@@ -1,0 +1,17 @@
+[package]
+name = "wemm_tokenizers_ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# Same Rust core as the Python `tokenizers` package; onig matches its regex engine.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
