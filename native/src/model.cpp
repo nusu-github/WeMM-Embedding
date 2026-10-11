@@ -266,6 +266,7 @@ WeMMModel::Packing WeMMModel::make_packing(const std::vector<int64_t>& seq_lens,
   std::vector<int64_t> last;
   pk.chunk_off_h.push_back(0);
   for (int64_t len : seq_lens) {
+    WEMM_CHECK(len > 0, "empty sequence in batch");
     const int32_t base_tok = cu.back();
     const int32_t base_row = int32_t(pk.chunk_start_h.size()) * int32_t(kChunk);
     for (int64_t j = 0; j < len; ++j) {

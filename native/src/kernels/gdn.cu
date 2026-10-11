@@ -549,8 +549,8 @@ GdnRecurrence gdn_chunk_recurrence(const GdnChunks& ch, const at::Tensor& chunk_
     WEMM_CHECK(carry.is_contiguous() && carry.numel() == H * num_seqs * kDK * DV, "gdn: bad carry buffer");
   else
     WEMM_CHECK(chunk_begin == 0, "gdn: a window after the first needs the carry buffer");
-  // Every sequence has at least one chunk, so C == num_seqs in a single window
-  // means one chunk each: S stays 0 and vnew == u, no recurrence to run.
+  // Every sequence has at least one chunk (sequences are non-empty), so
+  // C == num_seqs in a single window means one chunk each: S stays 0 and vnew == u, no recurrence to run.
   if (chunk_begin == 0 && C == num_seqs && !carry.defined()) return {at::Tensor(), ch.u};
   c10::cuda::CUDAGuard guard(ch.qg.device());
   GdnRecurrence r{at::empty({H, C, kDK, DV}, ch.qg.options()), at::empty({H, C, kChunk, DV}, ch.qg.options())};
@@ -580,7 +580,7 @@ void gdn_chunk_output(const GdnChunks& ch, const GdnRecurrence& rec, const at::T
   WEMM_CHECK(!rec.states.defined() || (rec.states.is_contiguous() && rec.states.numel() == H * C * kDK * kDK),
              "gdn_chunk_output: bad states");
   WEMM_CHECK(out.dim() == 2 && out.stride(1) == 1 && out.size(1) == H * kDK && out.stride(0) % 4 == 0 &&
-                 out.size(0) == seq_start.numel(),
+                 out.size(0) == seq_start.numel() && reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0,
              "gdn_chunk_output: out must be [L, H*128] with unit column stride");
   WEMM_CHECK(chunk_begin + C <= chunk_start.numel(), "gdn_chunk_output: bad window");
   if (C == 0) return;
@@ -598,6 +598,7 @@ void gdn_chunk_output(const GdnChunks& ch, const GdnRecurrence& rec, const at::T
     launch(gdn_output_kernel<float, false>, static_cast<const float*>(nullptr), 0, nullptr);
   } else {
     WEMM_CHECK(is_act(z) && z.stride(1) == 1 && z.stride(0) % 4 == 0 && z.size(1) == H * kDK &&
+                   reinterpret_cast<uintptr_t>(z.data_ptr()) % 8 == 0 &&
                    z.size(0) == out.size(0) && out.scalar_type() == z.scalar_type(),
                "gdn_chunk_output: bad z/out");
     WEMM_CHECK(w.scalar_type() == at::kFloat && w.is_contiguous() && w.numel() == kDK, "gdn_chunk_output: bad w");

@@ -27,7 +27,7 @@ Weight Weight::load(const at::Tensor& host, at::ScalarType dtype, const at::Devi
   const auto hist = kernels::weight_exponent_histogram(src);
   if (dtype == at::kHalf)
     for (int e = kFp16OverflowExp; e < 256; ++e)
-      WEMM_CHECK(hist[size_t(e)] == 0, "a weight overflows fp16; use compute_dtype=bf16");
+      WEMM_CHECK(hist[size_t(e)] == 0, "a weight overflows fp16 (or is inf/NaN); use compute_dtype=bf16");
   int base = 0;
   int64_t best = -1;
   for (int b = 0; b + 7 < 256; ++b) {
@@ -54,6 +54,14 @@ bool Weight::small_gemm(const at::Tensor& x, const std::optional<at::Tensor>& bi
   // Dense weights stay with cuBLASLt, which streams them at least as fast.
   if (!enabled || !compressed() || x.dim() != 2 || x.scalar_type() != dtype() || x.size(1) != size(1) ||
       !kernels::skinny_gemm_supported(x.size(0), size(0), size(1), x))
+    return false;
+  // otherwise fall back to the dense path (which reports bad arguments)
+  auto ok_dtype = [&](const at::Tensor& t) {
+    return t.scalar_type() == at::kFloat || t.scalar_type() == x.scalar_type();
+  };
+  if (!out.is_contiguous() || out.dim() != 2 || out.size(0) != x.size(0) || out.size(1) != size(0) ||
+      out.device() != x.device() || !ok_dtype(out) ||
+      (bias && (!bias->is_contiguous() || bias->numel() != size(0) || !ok_dtype(*bias))))
     return false;
   kernels::SkinnyWeight w;
   w.groups = groups_;

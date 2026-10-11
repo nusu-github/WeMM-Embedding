@@ -151,8 +151,9 @@ std::array<int64_t, 256> weight_exponent_histogram(const at::Tensor& x) {
 }
 
 CompressedWeight compress_weight(const at::Tensor& x, int base) {
-  WEMM_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.is_cuda() && x.numel() % kGroup == 0,
-             "compress_weight: bf16 CUDA input with numel % 64 == 0");
+  WEMM_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.is_cuda() && x.numel() > 0 &&
+                 x.numel() % kGroup == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+             "compress_weight: aligned bf16 CUDA input with numel % 64 == 0");
   c10::cuda::CUDAGuard guard(x.device());
   const int64_t n = x.numel(), G = n / kGroup;
   auto bytes = x.options().dtype(at::kByte);

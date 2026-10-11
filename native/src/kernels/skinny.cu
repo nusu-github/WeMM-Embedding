@@ -257,9 +257,9 @@ __global__ void __launch_bounds__(kThreads) skinny_kernel(Params p) {
 }  // namespace
 
 bool skinny_gemm_supported(int64_t M, int64_t N, int64_t K, const at::Tensor& x) {
-  return M >= 1 && M <= 64 && N % kRows == 0 && K % kStep == 0 && is_act(x) && x.stride(1) == 1 &&
+  return M >= 1 && M <= 64 && N % kRows == 0 && K % kStep == 0 && x.is_cuda() && is_act(x) && x.stride(1) == 1 &&
          x.stride(0) % 8 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
-         at::cuda::getCurrentDeviceProperties()->major >= 8;
+         at::cuda::getDeviceProperties(x.get_device())->major >= 8;
 }
 
 void skinny_gemm(const at::Tensor& x, const SkinnyWeight& w, const at::Tensor& bias, at::Tensor& out,
@@ -274,7 +274,7 @@ void skinny_gemm(const at::Tensor& x, const SkinnyWeight& w, const at::Tensor& b
              "skinny_gemm: bad bias");
   c10::cuda::CUDAGuard guard(x.device());
   const int tiles = int(N / kRows), steps = int(K / kStep);
-  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int sms = at::cuda::getDeviceProperties(x.get_device())->multiProcessorCount;
   // Split K only when there are fewer row tiles than SMs (then aim for ~2
   // blocks per SM, >= 2 steps each): the partial sums cost more than they
   // gain otherwise.
