@@ -2,6 +2,9 @@
 
 #include "wemm/weight.h"
 
+#include <cstdlib>
+#include <string>
+
 #include "wemm/common.h"
 #include "wemm/kernels.h"
 
@@ -34,33 +37,49 @@ Weight Weight::load(const at::Tensor& host, at::ScalarType dtype, const at::Devi
   }
   auto c = kernels::compress_weight(src, base);
   Weight w;
-  w.planes_ = std::move(c.planes);
-  w.sm_ = std::move(c.sm);
-  w.exps_ = std::move(c.exps);
-  w.offs_ = std::move(c.offs);
+  w.groups_ = std::move(c.groups);
+  w.spill_ = std::move(c.spill);
   w.base_ = base;
   w.dtype_ = dtype;
   w.shape_ = {src.size(0), src.size(1)};
   return w;
 }
 
+bool Weight::small_gemm(const at::Tensor& x, const std::optional<at::Tensor>& bias, at::Tensor& out,
+                        bool accumulate) const {
+  static const bool enabled = [] {
+    const char* e = std::getenv("WEMM_SKINNY_GEMM");
+    return !(e && std::string(e) == "0");
+  }();
+  // Dense weights stay with cuBLASLt, which streams them at least as fast.
+  if (!enabled || !compressed() || x.dim() != 2 || x.scalar_type() != dtype() || x.size(1) != size(1) ||
+      !kernels::skinny_gemm_supported(x.size(0), size(0), size(1), x))
+    return false;
+  kernels::SkinnyWeight w;
+  w.groups = groups_;
+  w.spill = spill_;
+  w.base = base_;
+  kernels::skinny_gemm(x, w, bias ? *bias : at::Tensor(), out, accumulate);
+  return true;
+}
+
 int64_t Weight::nbytes() const {
   if (!compressed()) return dense_.defined() ? int64_t(dense_.nbytes()) : 0;
-  return int64_t(planes_.nbytes() + sm_.nbytes() + exps_.nbytes() + offs_.nbytes());
+  return int64_t(groups_.nbytes() + spill_.nbytes());
 }
 
 at::Tensor Weight::dense() const {
   if (!compressed()) return dense_;
-  at::Tensor out = at::empty({shape_[0], shape_[1]}, sm_.options().dtype(dtype_));
+  at::Tensor out = at::empty({shape_[0], shape_[1]}, groups_.options().dtype(dtype_));
   return dense_into(out);
 }
 
 const at::Tensor& Weight::dense_into(at::Tensor& out) const {
   if (!compressed()) return dense_;
   WEMM_CHECK(out.is_contiguous() && out.scalar_type() == dtype_ && out.dim() == 2 && out.size(0) == shape_[0] &&
-                 out.size(1) == shape_[1] && out.device() == sm_.device(),
+                 out.size(1) == shape_[1] && out.device() == groups_.device(),
              "Weight::dense_into: bad output");
-  kernels::decompress_weight(planes_, sm_, exps_, offs_, base_, out);
+  kernels::decompress_weight(groups_, spill_, base_, out);
   return out;
 }
 

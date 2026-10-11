@@ -96,14 +96,25 @@ std::array<int64_t, 256> weight_exponent_histogram(const at::Tensor& x);
 // Compressed form of a bf16 CUDA tensor (numel % 64 == 0), see wemm/weight.h:
 // exponents in [base+1, base+7] become codes 1..7, the rest are outliers.
 struct CompressedWeight {
-  at::Tensor planes, sm, exps, offs;
+  at::Tensor groups, spill;
 };
 CompressedWeight compress_weight(const at::Tensor& x, int base);
 
 // Decodes a compressed bf16 weight (wemm/weight.h) into out (bf16 or fp16,
-// contiguous, numel = sm.numel()).
-void decompress_weight(const at::Tensor& planes, const at::Tensor& sm, const at::Tensor& exps,
-                       const at::Tensor& offs, int base, at::Tensor& out);
+// contiguous, numel = 64 * groups).
+void decompress_weight(const at::Tensor& groups, const at::Tensor& spill, int base, at::Tensor& out);
+
+// ----------------------------------------------------------- skinny GEMM
+// out (+)= x @ W^T (+ bias) for M <= 64 rows on sm_80+ with a compressed W
+// (groups/spill/base as in wemm/weight.h), decoded on the fly.
+// out: [M, N] fp32 or x's dtype; bias fp32 or x's dtype.
+struct SkinnyWeight {
+  at::Tensor groups, spill;
+  int base = 0;
+};
+bool skinny_gemm_supported(int64_t M, int64_t N, int64_t K, const at::Tensor& x);
+void skinny_gemm(const at::Tensor& x, const SkinnyWeight& w, const at::Tensor& bias, at::Tensor& out,
+                 bool accumulate);
 
 // Bytes of fp32 workspace one (head, chunk) pair needs in the GDN path; used
 // to size chunk windows.

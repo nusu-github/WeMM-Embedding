@@ -58,6 +58,7 @@ add_library(wemm SHARED
   src/kernels/gdn.cu
   src/kernels/fused.cu
   src/kernels/weight.cu
+  src/kernels/skinny.cu
 )
 target_include_directories(wemm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(wemm

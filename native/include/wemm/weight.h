@@ -6,15 +6,23 @@
 // exponent coding, arXiv:2603.17435): the exponents of LLM weights cluster in
 // a narrow range, so each element keeps its sign + 7 mantissa bits as one
 // byte and its 8-bit exponent becomes a 3-bit code: 1..7 = base + code,
-// 0 = outlier whose exponent is stored separately. Codes are stored as three
-// 64-bit bit-planes per group of 64 elements, so decoding is branch-light and
-// fully parallel. ~11.7 bits per weight (~27% smaller), and decompression
+// 0 = outlier whose exponent is stored separately. Every group of 64
+// consecutive elements is one 96-byte record (12 bits per weight, 25%
+// smaller than bf16/fp16):
+//   [0, 64)   sign/mantissa bytes
+//   [64, 88)  three 64-bit code bit-planes
+//   [88, 92)  int32: outliers spilled by the previous groups
+//   [92, 96)  exponents of the group's first 4 outliers
+// Further outliers (rare) go to a separate spill array. Records are read as
+// one contiguous stream and decode with a few bit operations per element,
+// so short-input GEMMs decode straight into registers; decompression
 // reproduces the dense weight bit for bit.
 
 #include <ATen/ATen.h>
 
 #include <array>
 #include <cstdint>
+#include <optional>
 
 namespace wemm {
 
@@ -28,8 +36,8 @@ class Weight {
   // the weight is used in (bf16 or fp16); fp16 overflow is rejected.
   static Weight load(const at::Tensor& host, at::ScalarType dtype, const at::Device& device, bool compress);
 
-  bool defined() const { return dense_.defined() || planes_.defined(); }
-  bool compressed() const { return planes_.defined(); }
+  bool defined() const { return dense_.defined() || groups_.defined(); }
+  bool compressed() const { return groups_.defined(); }
   int64_t size(int64_t d) const { return compressed() ? shape_[size_t(d)] : dense_.size(d); }
   at::ScalarType dtype() const { return compressed() ? dtype_ : dense_.scalar_type(); }
   // Device bytes held by this weight.
@@ -38,14 +46,18 @@ class Weight {
   at::Tensor dense() const;
   // Same as dense(), but decompresses into `out` ([N, K], dtype()) when compressed.
   const at::Tensor& dense_into(at::Tensor& out) const;
+  // Compressed weights: out (+)= x @ W^T (+ bias) with the few-row kernel
+  // that decodes the weight on the fly (no dense temporary). False when it
+  // does not apply (dense weight, M > 64, sm < 80, shapes, or disabled with
+  // WEMM_SKINNY_GEMM=0) and nothing was done.
+  bool small_gemm(const at::Tensor& x, const std::optional<at::Tensor>& bias, at::Tensor& out,
+                  bool accumulate) const;
 
  private:
   at::Tensor dense_;
   // compressed representation (all on the device)
-  at::Tensor planes_;  // int64 [G, 3] code bit-planes per 64-element group
-  at::Tensor sm_;      // uint8 [N*K] sign << 7 | mantissa
-  at::Tensor exps_;    // uint8 [outliers] exponents of code-0 elements, in order
-  at::Tensor offs_;    // int32 [G] outliers before each group
+  at::Tensor groups_;  // uint8 [N*K/64, 96] records
+  at::Tensor spill_;   // uint8 exponents of each group's 5th and later outliers
   int base_ = 0;
   at::ScalarType dtype_ = at::kHalf;
   std::array<int64_t, 2> shape_{};

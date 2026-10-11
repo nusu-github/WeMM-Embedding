@@ -295,11 +295,16 @@ void gemm_accumulate(const at::Tensor& x, const at::Tensor& w, const std::option
 at::Tensor gemm(const at::Tensor& x, const Weight& w, const std::optional<at::Tensor>& bias,
                 const std::optional<at::Tensor>& residual, Epilogue epilogue,
                 std::optional<at::ScalarType> out_dtype) {
+  if (!residual && epilogue == Epilogue::None) {
+    at::Tensor y = at::empty({x.size(0), w.size(0)}, x.options().dtype(out_dtype.value_or(x.scalar_type())));
+    if (w.small_gemm(x, bias, y, /*accumulate=*/false)) return y;
+  }
   return gemm(x, w.dense(), bias, residual, epilogue, out_dtype);
 }
 
 void gemm_accumulate(const at::Tensor& x, const Weight& w, const std::optional<at::Tensor>& bias,
                      at::Tensor& acc) {
+  if (w.small_gemm(x, bias, acc, /*accumulate=*/true)) return;
   gemm_accumulate(x, w.dense(), bias, acc);
 }
 

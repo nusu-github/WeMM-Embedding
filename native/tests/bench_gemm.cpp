@@ -6,6 +6,7 @@
 #include <cstdio>
 
 #include "wemm/gemm.h"
+#include "wemm/weight.h"
 
 template <typename F>
 double time_ms(F f, int iters = 20) {
@@ -56,5 +57,47 @@ int main() {
                 (long long)s.M, (long long)s.N, (long long)s.K, t_lt, t_aten, t_plain,
                 2.0 * s.M * s.N * s.K / t_plain / 1e9);
     std::printf("%22s weight stream: lt %.0f GB/s\n", "", 2.0 * s.N * s.K / t_lt / 1e6);
+  }
+
+  // ---- few-row GEMM on Weight (dense and compressed) vs cuBLASLt
+  std::printf("\nWeight GEMM (fp16): cuBLASLt dense | skinny compressed | decompress+cuBLASLt\n");
+  struct T { int64_t M, N, K; bool acc; const char* name; };
+  T ts[] = {{1, 12288, 2048, false, "gate_up"},  {13, 12288, 2048, false, "gate_up"}, {21, 8320, 2048, false, "in_proj"},
+            {21, 2048, 2048, true, "out_proj+=f32"}, {21, 2048, 6144, true, "down+=f32"}, {40, 12288, 2048, false, "gate_up"},
+            {64, 12288, 2048, false, "gate_up"},  {64, 2048, 6144, true, "down+=f32"}};
+  for (auto& t : ts) {
+    at::Tensor wh = (at::randn({t.N, t.K}) * 0.02).to(at::kBFloat16);
+    // a few large-exponent outliers
+    wh.view(-1).index_put_({at::randint(t.N * t.K, {64}, at::kLong)}, at::tensor(3.5).to(at::kBFloat16));
+    const auto dev = at::Device(at::kCUDA);
+    wemm::Weight wd = wemm::Weight::load(wh, at::kHalf, dev, false), wc = wemm::Weight::load(wh, at::kHalf, dev, true);
+    at::Tensor x = at::randn({t.M, t.K}, o);
+    at::Tensor acc0 = at::randn({t.M, t.N}, o.dtype(at::kFloat));
+    auto run = [&](const wemm::Weight& w, bool via_dense) {
+      if (t.acc) {
+        at::Tensor a = acc0.clone();
+        if (via_dense) wemm::gemm_accumulate(x, w.dense(), std::nullopt, a);
+        else wemm::gemm_accumulate(x, w, std::nullopt, a);
+        return a;
+      }
+      return via_dense ? wemm::gemm(x, w.dense()) : wemm::gemm(x, w);
+    };
+    at::Tensor ref = run(wd, true).to(at::kFloat), yc = run(wc, false).to(at::kFloat);
+    const double ec = ((yc - ref).abs().max() / ref.abs().max()).item<double>();
+    at::Tensor acc = acc0.clone();
+    auto timed = [&](const wemm::Weight& w, bool via_dense) {
+      return time_ms([&] {
+        if (t.acc) {
+          if (via_dense) wemm::gemm_accumulate(x, w.dense(), std::nullopt, acc);
+          else wemm::gemm_accumulate(x, w, std::nullopt, acc);
+        } else {
+          via_dense ? wemm::gemm(x, w.dense()) : wemm::gemm(x, w);
+        }
+      }, 50);
+    };
+    const double t_lt = timed(wd, true), t_sc = timed(wc, false), t_dc = timed(wc, true);
+    std::printf("%-14s M=%3lld N=%5lld K=%5lld  %.1f | %.1f | %.1f us   (%.0f | %.0f GB/s)  rel_err=%.1e\n", t.name,
+                (long long)t.M, (long long)t.N, (long long)t.K, t_lt * 1e3, t_sc * 1e3, t_dc * 1e3,
+                2.0 * t.N * t.K / t_lt / 1e6, wc.nbytes() / t_sc / 1e6, ec);
   }
 }
